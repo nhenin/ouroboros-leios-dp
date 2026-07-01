@@ -25,20 +25,30 @@ if [ "$TC" = "1" ]; then
   : "${IP_NODE2:=172.28.0.20}"
   : "${IP_NODE3:=172.28.0.30}"
 else
-  # Use distinct loopback aliases so each node's --host-addr (which
-  # ouroboros-network also uses as the source IP for outbound sockets) does
-  # not collide with another node's listening 4-tuple. With all three nodes
-  # sharing 127.0.0.1, outbound connect() can return EADDRNOTAVAIL because
-  # the kernel cannot assign (127.0.0.1:listener_port, 127.0.0.1:peer_port)
-  # for the new socket while the listener still owns that port. Splitting
-  # across the 127/8 range avoids the collision entirely.
-  : "${IP_NODE1:=127.2.0.1}"
-  : "${IP_NODE2:=127.2.0.2}"
-  : "${IP_NODE3:=127.2.0.3}"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # macOS only assigns 127.0.0.1 to lo0 by default. Other 127/8 addresses
+    # need explicit aliases, which would require sudo.
+    : "${IP_NODE1:=127.0.0.1}"
+    : "${IP_NODE2:=127.0.0.1}"
+    : "${IP_NODE3:=127.0.0.1}"
+  else
+    # Use distinct loopback aliases so each node's --host-addr (which
+    # ouroboros-network also uses as the source IP for outbound sockets) does
+    # not collide with another node's listening 4-tuple. With all three nodes
+    # sharing 127.0.0.1, outbound connect() can return EADDRNOTAVAIL because
+    # the kernel cannot assign (127.0.0.1:listener_port, 127.0.0.1:peer_port)
+    # for the new socket while the listener still owns that port. Splitting
+    # across the 127/8 range avoids the collision entirely.
+    : "${IP_NODE1:=127.2.0.1}"
+    : "${IP_NODE2:=127.2.0.2}"
+    : "${IP_NODE3:=127.2.0.3}"
+  fi
 fi
 # X-ray observability (on by default, disable with XRAY=0)
 : "${XRAY:=1}"
 : "${XRAY_SOURCE_DIR:="${SOURCE_DIR}/../extras/x-ray"}"
+# Workload feeder (on by default, disable with TX_CENTRIFUGE=0)
+: "${TX_CENTRIFUGE:=1}"
 set +a
 
 # Check for required commands
@@ -50,8 +60,10 @@ REQUIRED_COMMANDS=(
   "envsubst"
   "cardano-node"
   "cardano-cli"
-  "tx-centrifuge"
 )
+if [ "$TX_CENTRIFUGE" = "1" ]; then
+  REQUIRED_COMMANDS+=("tx-centrifuge")
+fi
 
 MISSING_COMMANDS=()
 for cmd in "${REQUIRED_COMMANDS[@]}"; do
@@ -76,7 +88,7 @@ if [ -d "$WORKING_DIR" ]; then
   echo "Working directory already exists: $WORKING_DIR"
   read -r -rp "Remove and re-initialize? (Y/n): " response
   if [[ "$response" =~ ^[Yy]$ || -z "$response" ]]; then
-    chmod a+w -R "$WORKING_DIR"
+    chmod -R a+w "$WORKING_DIR"
     rm -rf "$WORKING_DIR"
   else
     echo "Aborting."
@@ -92,10 +104,14 @@ CONFIG_DIR="${SOURCE_DIR}/config"
 
 # Copy genesis files and set start time
 cp -r "$CONFIG_DIR/genesis" "$WORKING_DIR/genesis"
-chmod u+w -R "${WORKING_DIR}/genesis"
+chmod -R u+w "${WORKING_DIR}/genesis"
 
 startTimeEpoch=$(date +%s)
-startTimeIso=$(date -u -d "@$startTimeEpoch" +"%Y-%m-%dT%H:%M:%SZ")
+if startTimeIso=$(date -u -d "@$startTimeEpoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null); then
+  :
+else
+  startTimeIso=$(date -u -r "$startTimeEpoch" +"%Y-%m-%dT%H:%M:%SZ")
+fi
 
 jq --argjson time "$startTimeEpoch" '.startTime = $time' \
   "$CONFIG_DIR/genesis/byron-genesis.json" >"$WORKING_DIR/genesis/byron-genesis.json"
@@ -116,7 +132,7 @@ for i in "${nodes[@]}"; do
   # Copy config files
   cat "$CONFIG_DIR/config.yaml" |
     yq ".TraceOptionNodeName = \"$NODE_NAME\"" |
-    yq ".TraceOptions.\"\".backends[1] = \"PrometheusSimple 0.0.0.0 $((12900 + "$i"))\"" \
+    yq ".TraceOptions[\"\"].backends[1] = \"PrometheusSimple 0.0.0.0 $((12900 + i))\"" \
       >"$NODE_DIR/config.yaml"
 
   # Generate upstream endpoints to other nodes
@@ -145,8 +161,8 @@ for i in "${nodes[@]}"; do
   chmod 400 "$NODE_DIR/keys"/*.skey
 done
 
-# Copy utxo-keys for tx-centrifuge and set permissions
-echo "Setting up utxo-keys for tx-centrifuge"
+# Copy utxo-keys for transaction feeders and set permissions
+echo "Setting up utxo-keys for transaction feeders"
 cp -r "$CONFIG_DIR/utxo-keys" "$WORKING_DIR/utxo-keys"
 find "$WORKING_DIR/utxo-keys" -name "*.skey" -exec chmod 400 {} \;
 cp -r "$CONFIG_DIR/funds.json" "$WORKING_DIR/funds.json"
@@ -157,6 +173,14 @@ export ALLOY_CONFIG="${WORKING_DIR}/config.alloy"
 envsubst <"${CONFIG_DIR}/alloy.template" >"${ALLOY_CONFIG}"
 
 echo "Starting proto-devnet ..."
+BASE_COMPOSE="${SOURCE_DIR}/process-compose.yaml"
+if [ "$TX_CENTRIFUGE" = "0" ]; then
+  BASE_COMPOSE="${WORKING_DIR}/process-compose.no-tx-centrifuge.yaml"
+  yq 'del(.processes.TxCentrifuge)' "${SOURCE_DIR}/process-compose.yaml" >"${BASE_COMPOSE}"
+  echo "  TxCentrifuge: disabled TX_CENTRIFUGE=${TX_CENTRIFUGE}"
+else
+  echo "  TxCentrifuge: enabled TX_CENTRIFUGE=${TX_CENTRIFUGE}"
+fi
 # Traffic control integration
 TC_COMPOSE=()
 if [ "$TC" = "1" ]; then
@@ -179,7 +203,18 @@ if [ "$XRAY" = "1" ]; then
 else
   echo "  X-ray observability: disabled XRAY=${XRAY}"
 fi
+process_compose_pid=""
+stop_process_compose() {
+  if [ -n "$process_compose_pid" ] && kill -0 "$process_compose_pid" >/dev/null 2>&1; then
+    kill -INT "$process_compose_pid" >/dev/null 2>&1 || true
+    wait "$process_compose_pid" >/dev/null 2>&1 || true
+  fi
+}
+trap stop_process_compose INT TERM
+
 process-compose --no-server \
-  -f "${SOURCE_DIR}/process-compose.yaml" \
+  -f "${BASE_COMPOSE}" \
   "${TC_COMPOSE[@]}" \
-  "${XRAY_COMPOSE[@]}"
+  "${XRAY_COMPOSE[@]}" &
+process_compose_pid=$!
+wait "$process_compose_pid"

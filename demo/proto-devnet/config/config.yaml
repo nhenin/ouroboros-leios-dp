@@ -109,6 +109,12 @@ TraceOptions:
     severity: Info
   Mempool:
     severity: Debug
+  Mempool.RemoveTxs:
+    severity: Info
+    detail: DDetailed
+  Mempool.RejectedTx:
+    severity: Info
+    detail: DDetailed
   Mempool.AttemptAdd:
     severity: Silence
   Mempool.LedgerFound:
