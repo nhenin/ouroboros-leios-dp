@@ -13,6 +13,7 @@ Usage: demo-server.py <port> <dir> <config-path>
 
 import json
 import os
+import subprocess
 import sys
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
@@ -52,6 +53,14 @@ def main():
             return super().do_GET()
 
         def do_POST(self):
+            if self.path.rstrip("/") == "/flush-queues":
+                # Flush = restart the nodes' short-term memory: kill the three
+                # cardano-node processes; process-compose (restart: always)
+                # brings them back within seconds with EMPTY mempools. The
+                # chain on disk is untouched — only waiting txs are forgotten.
+                subprocess.run(["pkill", "-f", "cardano-node run"], check=False)
+                self._send_json(200, b'{"ok":true}')
+                return
             # Writable endpoints: the actor population, and the eviction-generator
             # switch (the run script's controller loop watches the latter and
             # starts/stops the matching load generator).

@@ -3,6 +3,8 @@ is_strict: true
 
 processes:
   Node1:
+    availability:
+      restart: "always"
     command: |
       NODE_DIR="${WORKING_DIR}/node1" \
       IP="${IP_NODE1}" \
@@ -17,6 +19,8 @@ processes:
       failure_threshold: 60
 
   Node2:
+    availability:
+      restart: "always"
     command: |
       NODE_DIR="${WORKING_DIR}/node2" \
       IP="${IP_NODE2}" \
@@ -31,6 +35,8 @@ processes:
       failure_threshold: 60
 
   Node3:
+    availability:
+      restart: "always"
     command: |
       NODE_DIR="${WORKING_DIR}/node3" \
       IP="${IP_NODE3}" \
