@@ -68,6 +68,20 @@ def main():
                     if target.endswith("eviction-control.json"):
                         if config.get("mode") not in ("off", "type1", "type2", "type3"):
                             raise ValueError("mode must be off | type1 | type2 | type3")
+                    else:
+                        # Merge into the existing config instead of replacing it,
+                        # so a tab that never touched a control cannot wipe what
+                        # another tab set. Posting null for a key deletes it
+                        # (e.g. laneMix: null = hand the lane choice back to the
+                        # simulated senders).
+                        current = {}
+                        try:
+                            with open(target) as handle:
+                                current = json.load(handle)
+                        except (FileNotFoundError, ValueError):
+                            pass
+                        current.update(config)
+                        config = {k: v for k, v in current.items() if v is not None}
                 except Exception as exc:  # noqa: BLE001 - report any parse error to the caller
                     self._send_json(400, json.dumps({"error": str(exc)}).encode())
                     return

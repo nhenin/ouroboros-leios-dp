@@ -141,8 +141,10 @@ rm -f "$RUN_LOG"
 : >"$LIVE_STREAM"
 : >"$ACTOR_STREAM"
 : >"$EVICT_STREAM"
+: >"${DEMO_DIR}/removed-txs.ndjson"
 rm -f "$QUOTES_FILE"
 rm -f "${DEMO_DIR}/leios-status.json"
+rm -f "${DEMO_DIR}/lifecycle.json"
 # Start from a default actor population (the dashboard rewrites this live).
 cat >"$ACTOR_CONFIG" <<'JSON'
 {"honest":60,"patient":20,"impatient":20,"valueMinAda":1,"valueMaxAda":30,"urgencyMin":0.02,"urgencyMax":0.35,"urgentLatency":1,"optimisticLatency":4,"reservationMultiple":1,"feeBuffer":1.2}
@@ -206,6 +208,7 @@ pkill -f "actor-aggregator.py" >/dev/null 2>&1 || true
 sleep 1
 : >"$LIVE_STREAM"
 : >"$ACTOR_STREAM"
+: >"${DEMO_DIR}/removed-txs.ndjson"
 
 # Stream every node's forge traces into the dashboard's live feed. Each block is
 # forged by exactly one node, so merging the three logs gives the full sequence.
@@ -302,6 +305,7 @@ elif [ "$ACTOR_MODE" = "1" ]; then
       --cycles "$CYCLES" \
       --delay-ms "$DELAY_MS" \
       --actor-mode \
+      --fanout "${FANOUT:-12}" \
       --quotes-file "$QUOTES_FILE" \
       --actor-config "$ACTOR_CONFIG" \
       "$@" \
@@ -309,7 +313,8 @@ elif [ "$ACTOR_MODE" = "1" ]; then
     actor_feeder_pid=$!
   }
   start_actor_feeder
-  python3 "$SOURCE_DIR/actor-aggregator.py" "$WORKING_DIR/actor-feeder.log" "$ACTOR_STREAM" "$ACTOR_BUCKET" &
+  python3 "$SOURCE_DIR/actor-aggregator.py" "$WORKING_DIR/actor-feeder.log" "$ACTOR_STREAM" "$ACTOR_BUCKET" \
+    --removed "$DEMO_DIR/removed-txs.ndjson" --lifecycle "$DEMO_DIR/lifecycle.json" &
   aggregator_pid=$!
 else
   FEED_MODE="fixed"
@@ -332,7 +337,7 @@ fi
 #          feeder log -> aggregator -> evictions.ndjson, stage "rejected").
 # Generators restart cleanly: before each start we ask the node for the fund's
 # current largest UTxO and hand it to the feeder (--initial-txin/--initial-value).
-: "${T1_BID:=12000000}"
+: "${T1_BID:=auto}"   # auto = 1.8x the live urgent cost at scenario start
 : "${T1_METADATA:=10000}"
 : "${T1_DELAY_MS:=50}"
 : "${T2_FEE:=10000000}"
@@ -341,9 +346,11 @@ fi
 EVGEN_FUND_INDEX=2
 
 write_run_config() {
-  # What the dashboard's "what is running" explainer reads.
-  printf '{"feed":"%s","feeLovelace":%s,"metadataBytes":%s,"delayMs":%s,"generator":"%s"}\n' \
-    "$FEED_MODE" "$FEE" "$METADATA_BYTES" "$DELAY_MS" "${1:-off}" >"${RUN_CONFIG}.tmp"
+  # What the dashboard's "what is running" explainer reads. t1Bid/t1TxBytes
+  # describe the CURRENT squeeze burst (0 when none runs) so the dashboard can
+  # say at which quote the burst txs get priced out.
+  printf '{"feed":"%s","feeLovelace":%s,"metadataBytes":%s,"delayMs":%s,"generator":"%s","t1Bid":%s,"t1TxBytes":%s}\n' \
+    "$FEED_MODE" "$FEE" "$METADATA_BYTES" "$DELAY_MS" "${1:-off}" "${CURRENT_T1_BID:-0}" "$((T1_METADATA + 300))" >"${RUN_CONFIG}.tmp"
   mv "${RUN_CONFIG}.tmp" "$RUN_CONFIG"
 }
 
@@ -393,13 +400,37 @@ eviction_controller() {
           initial_args=(--initial-txin "${line%% *}" --initial-value "${line##* }")
         fi
         if [ "$want" = "type1" ]; then
+          # Calibrate the burst bid from the LIVE urgent quote: high enough to
+          # be admitted now, low enough to be priced out after ~3 blocks of
+          # +25% climb (bid = 1.8x today's cost for a burst-sized tx). A fixed
+          # bid only works for one price regime; this works in all of them.
+          t1_bid="$T1_BID"
+          if [ "$t1_bid" = "auto" ]; then
+            t1_bid=$(python3 -c "
+import json, sys
+try:
+    quote = json.load(open('$QUOTES_FILE'))['urgent']
+except Exception:
+    quote = 704
+size = $T1_METADATA + 300
+print(max(1500000, quote * size * 9 // 5))
+")
+          fi
+          echo "type1 burst: bid ${t1_bid} lovelace (~1.8x the live urgent cost)"
+          CURRENT_T1_BID="$t1_bid"
           "$LANE_FEEDER" --socket "$socket" --funds "$WORKING_DIR/funds.json" \
-            --network-magic "$NETWORK_MAGIC" --fee "$T1_BID" \
+            --network-magic "$NETWORK_MAGIC" --fee "$t1_bid" \
             --metadata-bytes "$T1_METADATA" --cycles "$CYCLES" \
             --delay-ms "$T1_DELAY_MS" --independent-funding \
             --fund-index "$EVGEN_FUND_INDEX" "${initial_args[@]}" \
             >"$WORKING_DIR/evgen-type1.log" 2>&1 &
           pid=$!
+          # Door rejections (once the quote already tops the burst bid) only
+          # show in the generator's own log — stream them too.
+          python3 "$SOURCE_DIR/eviction-aggregator.py" \
+            "$WORKING_DIR/evgen-type1.log" "$EVICT_STREAM" &
+          agg_pid=$!
+          echo "$agg_pid" >"$WORKING_DIR/evgen-aggregator.pid"
         else
           "$LANE_FEEDER" --socket "$socket" --funds "$WORKING_DIR/funds.json" \
             --network-magic "$NETWORK_MAGIC" --fee "$T2_FEE" \
@@ -416,6 +447,7 @@ eviction_controller() {
         echo "$pid" >"$WORKING_DIR/evgen.pid"
       fi
       current="$want"
+      [ "$current" = "type1" ] || CURRENT_T1_BID=0
       write_run_config "$current"
     elif [ "$current" = "type3" ]; then
       : # flag-file scenario: nothing to babysit

@@ -30,7 +30,11 @@ import re
 import sys
 import time
 
-LANE_RE = re.compile(r"forge lanes:.*?RB[^0-9]*urgent=(\d+).*?EB[^0-9]*optimistic=(\d+)")
+SPEND_INPUT_RE = re.compile(r'dtbrSpendInputs = fromList \[TxIn \(TxId \{unTxId = SafeHash \\"([0-9a-f]{64})')
+LANE_RE = re.compile(
+    r"forge lanes:.*?RB[^0-9]*urgent=(\d+).*?EB[^0-9]*optimistic=(\d+)"
+    r"(?:.*?rbBytes=(\d+))?(?:.*?ebBytes=(\d+))?"
+)
 QUEUE_RE = re.compile(r"forge queue:.*?urgent=(\d+).*?optimistic=(\d+)")
 PRICE_RE = re.compile(r"forge prices:.*?urgent=(\d+).*?optimistic=(\d+)")
 
@@ -69,7 +73,16 @@ def main():
     eb_certified = set()
 
     def write_leios_status():
-        pending = [h for h in eb_forged if h not in eb_certified]
+        # "Stalled" = uncertified AND newer than the last certified EB. An older
+        # uncertified EB was superseded (a later one certified; its txs rode
+        # again) — counting those forever would inflate the number all run long.
+        last_cert_slot = max(
+            (eb_forged[h]["slot"] for h in eb_certified if h in eb_forged), default=-1
+        )
+        pending = [
+            h for h in eb_forged
+            if h not in eb_certified and eb_forged[h]["slot"] > last_cert_slot
+        ]
         recent = sorted(eb_forged.items(), key=lambda kv: kv[1]["slot"])[-120:]
         status = {
             "forged": len(eb_forged),
@@ -98,6 +111,35 @@ def main():
     def emit_eviction(record):
         with open(evictions_path, "a") as out:
             out.write(json.dumps(record) + "\n")
+            out.flush()
+
+    # Per-tx removal stream (short txid prefix + stage + lane) so the actor
+    # aggregator can attribute each removal to the cockpit command ("generation")
+    # that sent the tx. Same dir as the block stream the dashboard polls.
+    removed_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), "removed-txs.ndjson")
+
+    # Live mempool size (node1's view, the submission point): every AddedTx /
+    # RemoveTxs trace carries mempoolSize, so the dashboard can move between
+    # forges instead of freezing until the next block. Throttled to 2 Hz.
+    mempool_live_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), "mempool-live.json")
+    mempool_live_last = [0.0]
+
+    def write_mempool_live(size, at):
+        now = time.time()
+        if now - mempool_live_last[0] < 0.25:
+            return
+        mempool_live_last[0] = now
+        tmp = mempool_live_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"numTxs": size.get("numTxs"), "bytes": size.get("bytes"), "at": at}, f)
+        os.replace(tmp, mempool_live_path)
+
+    def emit_removed(records):
+        if not records:
+            return
+        with open(removed_path, "a") as out:
+            for r in records:
+                out.write(json.dumps(r) + "\n")
             out.flush()
 
     def emit(record):
@@ -152,6 +194,15 @@ def main():
                     continue
                 except Exception:
                     pass
+            if p == node1 and "Mempool.AddedTx" in line:
+                try:
+                    inner = json.loads(json.loads(line)["message"])
+                    size = inner.get("data", {}).get("mempoolSize") or {}
+                    if size:
+                        write_mempool_live(size, inner.get("at"))
+                except Exception:
+                    pass
+                continue
             if evictions_path and p == node1 and "Mempool.RemoveTxs" in line:
                 handled = False
                 try:
@@ -160,6 +211,8 @@ def main():
                         data = inner.get("data", {})
                         txs = data.get("txs", [])
                         mempool_txs = (data.get("mempoolSize") or {}).get("numTxs")
+                        if data.get("mempoolSize"):
+                            write_mempool_live(data["mempoolSize"], inner.get("at"))
                         # Classify per tx. A BidBelowQuote removal is a REAL price
                         # eviction (the quote overtook the bid while waiting). An
                         # AllInputsAreSpent removal is housekeeping: the tx's coin
@@ -168,10 +221,26 @@ def main():
                         # separate records so the dashboard never sells housekeeping
                         # as drops.
                         buckets = {}
+                        entries = []
                         for tx in txs:
                             blob = json.dumps(tx)
                             priced = "BidBelowQuote" in blob
                             stage = "evicted" if priced else "cleared"
+                            short = (tx.get("tx") or {}).get("txid") if isinstance(tx, dict) else None
+                            # the tx's (single) input parent, for cascade detection
+                            parent = None
+                            pm = SPEND_INPUT_RE.search(blob)
+                            if pm:
+                                parent = pm.group(1)[:8]
+                            if short:
+                                entries.append({
+                                    "txid": short,
+                                    "stage": stage,
+                                    "parent": parent,
+                                    "lane": "urgent" if "dtbrInclusion = Urgent" in blob
+                                            else "optimistic" if "dtbrInclusion = Optimistic" in blob
+                                            else "?",
+                                })
                             b = buckets.setdefault(
                                 stage,
                                 {"n": 0, "urgent": 0, "optimistic": 0, "bid": 0, "spent": 0},
@@ -193,6 +262,23 @@ def main():
                                 "mempoolTxs": mempool_txs,
                             })
                             ev_index += 1
+                        # A chained descendant of an evicted tx is removed in the
+                        # same sweep as AllInputsAreSpent — it never reached a
+                        # block. Walk the in-batch parent links from each evicted
+                        # tx and reclassify those "cleared" as "orphaned" so the
+                        # lifecycle never sells a dropped cascade as forged.
+                        by_id = {e["txid"]: e for e in entries}
+                        dropped = {e["txid"] for e in entries if e["stage"] == "evicted"}
+                        changed = True
+                        while changed:
+                            changed = False
+                            for e in entries:
+                                if (e["stage"] == "cleared" and e["parent"] in dropped
+                                        and e["txid"] not in dropped):
+                                    e["stage"] = "orphaned"
+                                    dropped.add(e["txid"])
+                                    changed = True
+                        emit_removed([{k: e[k] for k in ("txid", "stage", "lane")} for e in entries])
                         handled = True
                 except Exception:
                     pass
@@ -202,6 +288,8 @@ def main():
             if lane:
                 flush_pending(p)   # a new round starts: whatever was pending is final
                 state[p]["rb"], state[p]["eb"] = int(lane.group(1)), int(lane.group(2))
+                state[p]["rbBytes"] = int(lane.group(3)) if lane.group(3) else None
+                state[p]["ebBytes"] = int(lane.group(4)) if lane.group(4) else None
                 continue
             queue = QUEUE_RE.search(line)
             if queue:
@@ -215,6 +303,11 @@ def main():
                     "optimistic": int(price.group(2)),
                     "rb": state[p]["rb"],
                     "eb": state[p]["eb"],
+                    # bytes each lane occupies — the block's TRUE fullness
+                    # (capacity is a byte budget; tx counts mislead when fat
+                    # and thin txs mix)
+                    "rbBytes": state[p].get("rbBytes"),
+                    "ebBytes": state[p].get("ebBytes"),
                     "qu": state[p]["qu"],
                     "qo": state[p]["qo"],
                     # the EB forged in this round, if any — joins against
@@ -222,6 +315,8 @@ def main():
                     # the EB currently being filled on this log (sticky until a
                     # new one is forged): several rounds can share one EB
                     "ebHash": state[p].get("ebHash"),
+                    # which node forged this block (the log that produced the trio)
+                    "node": os.path.basename(os.path.dirname(p)),
                 }
                 block_index += 1
                 if record["eb"] > 0 and record["ebHash"] is None:
