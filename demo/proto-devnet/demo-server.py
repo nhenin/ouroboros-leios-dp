@@ -19,11 +19,12 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 
 def main():
-    if len(sys.argv) != 4:
-        sys.exit("usage: demo-server.py <port> <dir> <config-path>")
+    if len(sys.argv) not in (4, 5):
+        sys.exit("usage: demo-server.py <port> <dir> <config-path> [<devnet-working-dir>]")
     port = int(sys.argv[1])
     directory = sys.argv[2]
     config_path = sys.argv[3]
+    working_dir = sys.argv[4] if len(sys.argv) == 5 else "/tmp/dijkstra-live-demo"
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
@@ -54,11 +55,28 @@ def main():
 
         def do_POST(self):
             if self.path.rstrip("/") == "/flush-queues":
-                # Flush = restart the nodes' short-term memory: kill the three
-                # cardano-node processes; process-compose (restart: always)
-                # brings them back within seconds with EMPTY mempools. The
-                # chain on disk is untouched — only waiting txs are forgotten.
-                subprocess.run(["pkill", "-f", "cardano-node run"], check=False)
+                # Flush a chosen lane, or both. One lane: raise each node's
+                # flag file — the node's watcher removes that lane's waiting
+                # txs within a couple of seconds, no restart. Both: kill the
+                # three cardano-node processes; process-compose (restart:
+                # always) brings them back within seconds with EMPTY
+                # mempools. Either way the chain on disk is untouched.
+                length = int(self.headers.get("Content-Length", "0"))
+                lane = "all"
+                if length:
+                    try:
+                        lane = json.loads(self.rfile.read(length)).get("lane", "all")
+                    except Exception:
+                        pass
+                if lane in ("urgent", "optimistic"):
+                    for node in ("node1", "node2", "node3"):
+                        flag = os.path.join(working_dir, node, "flush-lane")
+                        tmp = flag + ".tmp"
+                        with open(tmp, "w") as handle:
+                            handle.write(lane)
+                        os.replace(tmp, flag)
+                else:
+                    subprocess.run(["pkill", "-f", "cardano-node run"], check=False)
                 self._send_json(200, b'{"ok":true}')
                 return
             # Writable endpoints: the actor population, and the eviction-generator

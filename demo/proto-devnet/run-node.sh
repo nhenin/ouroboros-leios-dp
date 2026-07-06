@@ -7,6 +7,8 @@ set -euo pipefail
 cd "$NODE_DIR"
 
 export LEIOS_DB_PATH="leios.db"
+# Demo control: the lane-flush flag this node watches (see demo-server.py).
+export DIJKSTRA_FLUSH_LANE_FILE="${NODE_DIR}/flush-lane"
 
 # Make socket accessible to non-root (node runs elevated for namespace access)
 (

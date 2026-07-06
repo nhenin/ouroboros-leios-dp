@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 
 SPEND_INPUT_RE = re.compile(r'dtbrSpendInputs = fromList \[TxIn \(TxId \{unTxId = SafeHash \\"([0-9a-f]{64})')
 LANE_RE = re.compile(
@@ -37,6 +38,11 @@ LANE_RE = re.compile(
 )
 QUEUE_RE = re.compile(r"forge queue:.*?urgent=(\d+).*?optimistic=(\d+)")
 PRICE_RE = re.compile(r"forge prices:.*?urgent=(\d+).*?optimistic=(\d+)")
+
+
+# The ledger's own verdict inside a BidBelowQuote removal: what the tx offered
+# (supplied) vs what the lane charges for it at the crossing (expected).
+MISMATCH_RE = re.compile(r"supplied: Coin (\d+), expected: Coin (\d+)")
 
 
 def main():
@@ -142,6 +148,28 @@ def main():
                 out.write(json.dumps(r) + "\n")
             out.flush()
 
+    # Per-eviction DETAIL stream: one line per priced-out tx with the exact
+    # numbers the ledger judged (its bid vs what the lane now charges for it)
+    # and how long it waited (admission time joined by txid prefix). The
+    # dashboard's pressure journal opens this to tell each tx's full story.
+    evicted_detail_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), "evicted-txs.ndjson")
+    added_at = {}  # txid prefix -> ISO admission time (node1, bounded)
+
+    def note_added(txid, at):
+        if txid and at:
+            if len(added_at) > 60000:
+                for k in list(added_at)[:30000]:
+                    added_at.pop(k, None)
+            added_at[txid] = at
+
+    def emit_evicted_detail(records):
+        if not records:
+            return
+        with open(evicted_detail_path, "a") as out:
+            for r in records:
+                out.write(json.dumps(r) + "\n")
+            out.flush()
+
     def emit(record):
         with open(out_path, "a") as out:
             out.write(json.dumps(record) + "\n")
@@ -197,9 +225,11 @@ def main():
             if p == node1 and "Mempool.AddedTx" in line:
                 try:
                     inner = json.loads(json.loads(line)["message"])
-                    size = inner.get("data", {}).get("mempoolSize") or {}
+                    data = inner.get("data", {})
+                    size = data.get("mempoolSize") or {}
                     if size:
                         write_mempool_live(size, inner.get("at"))
+                    note_added((data.get("tx") or {}).get("txid"), inner.get("at"))
                 except Exception:
                     pass
                 continue
@@ -227,6 +257,7 @@ def main():
                             priced = "BidBelowQuote" in blob
                             stage = "evicted" if priced else "cleared"
                             short = (tx.get("tx") or {}).get("txid") if isinstance(tx, dict) else None
+                            bid_required = MISMATCH_RE.search(blob) if priced else None
                             # the tx's (single) input parent, for cascade detection
                             parent = None
                             pm = SPEND_INPUT_RE.search(blob)
@@ -240,6 +271,8 @@ def main():
                                     "lane": "urgent" if "dtbrInclusion = Urgent" in blob
                                             else "optimistic" if "dtbrInclusion = Optimistic" in blob
                                             else "?",
+                                    "bid": int(bid_required.group(1)) if bid_required else None,
+                                    "required": int(bid_required.group(2)) if bid_required else None,
                                 })
                             b = buckets.setdefault(
                                 stage,
@@ -279,6 +312,26 @@ def main():
                                     dropped.add(e["txid"])
                                     changed = True
                         emit_removed([{k: e[k] for k in ("txid", "stage", "lane")} for e in entries])
+                        removed_at = inner.get("at")
+                        details = []
+                        for e in entries:
+                            if e["stage"] not in ("evicted", "orphaned"):
+                                continue
+                            seen = added_at.pop(e["txid"], None)
+                            waited = None
+                            if seen and removed_at:
+                                try:
+                                    t0 = datetime.fromisoformat(seen.replace("Z", "+00:00"))
+                                    t1 = datetime.fromisoformat(removed_at.replace("Z", "+00:00"))
+                                    waited = round((t1 - t0).total_seconds(), 1)
+                                except Exception:
+                                    pass
+                            details.append({
+                                "txid": e["txid"], "stage": e["stage"], "lane": e["lane"],
+                                "t": removed_at, "addedAt": seen, "waitedS": waited,
+                                "bid": e.get("bid"), "required": e.get("required"),
+                            })
+                        emit_evicted_detail(details)
                         handled = True
                 except Exception:
                     pass

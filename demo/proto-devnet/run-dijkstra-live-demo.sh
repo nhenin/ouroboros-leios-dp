@@ -228,7 +228,7 @@ printf '{"mode":"off"}\n' >"$EVICTION_CONTROL"
 
 # Serve the dashboard. live.ndjson lives in the same directory, so the page can
 # poll it from the same origin.
-python3 "$SOURCE_DIR/demo-server.py" "$HTTP_PORT" "$DEMO_DIR" "$ACTOR_CONFIG" >/dev/null 2>&1 &
+python3 "$SOURCE_DIR/demo-server.py" "$HTTP_PORT" "$DEMO_DIR" "$ACTOR_CONFIG" "$WORKING_DIR" >/dev/null 2>&1 &
 http_pid=$!
 
 run_feeder_forever() {
@@ -401,8 +401,9 @@ eviction_controller() {
         fi
         if [ "$want" = "type1" ]; then
           # Calibrate the burst bid from the LIVE urgent quote: high enough to
-          # be admitted now, low enough to be priced out after ~3 blocks of
-          # +25% climb (bid = 1.8x today's cost for a burst-sized tx). A fixed
+          # be admitted now, low enough to be priced out fast — 1.35x today's
+          # cost is crossed on the second +25% step (1.25^2 = 1.56), so the
+          # burst's own full blocks price it out within ~2 blocks. A fixed
           # bid only works for one price regime; this works in all of them.
           t1_bid="$T1_BID"
           if [ "$t1_bid" = "auto" ]; then
@@ -413,10 +414,10 @@ try:
 except Exception:
     quote = 704
 size = $T1_METADATA + 300
-print(max(1500000, quote * size * 9 // 5))
+print(max(1500000, quote * size * 27 // 20))
 ")
           fi
-          echo "type1 burst: bid ${t1_bid} lovelace (~1.8x the live urgent cost)"
+          echo "type1 burst: bid ${t1_bid} lovelace (~1.35x the live urgent cost)"
           CURRENT_T1_BID="$t1_bid"
           "$LANE_FEEDER" --socket "$socket" --funds "$WORKING_DIR/funds.json" \
             --network-magic "$NETWORK_MAGIC" --fee "$t1_bid" \
