@@ -34,9 +34,18 @@ from datetime import datetime
 SPEND_INPUT_RE = re.compile(r'dtbrSpendInputs = fromList \[TxIn \(TxId \{unTxId = SafeHash \\"([0-9a-f]{64})')
 LANE_RE = re.compile(
     r"forge lanes:.*?RB[^0-9]*urgent=(\d+).*?EB[^0-9]*optimistic=(\d+)"
-    r"(?:.*?rbBytes=(\d+))?(?:.*?ebBytes=(\d+))?"
+    r"(?:.*?rbBytes=(\d+))?(?:.*?ebBytes=(\d+))?(?:.*?ebHeld=(true|false))?"
 )
-QUEUE_RE = re.compile(r"forge queue:.*?urgent=(\d+).*?optimistic=(\d+)")
+QUEUE_RE = re.compile(
+    r"forge queue:.*?urgent=(\d+).*?optimistic=(\d+)"
+    r"(?:.*?quBytes=(\d+).*?quCap=(\d+).*?quSecs=([\d.eE-]+)"
+    r".*?qoBytes=(\d+).*?qoCap=(\d+).*?qoSecs=([\d.eE-]+))?"
+)
+
+# Each lane's diffusion-time budget: mirrors the node's mempoolTimeoutCapacity
+# default (5 s) split by laneTimeoutCapacity (urgent 1/3, patient 2/3).
+MEMPOOL_TIME_BUDGET_S = 5.0
+URGENT_TIME_SHARE = 1.0 / 3.0
 PRICE_RE = re.compile(r"forge prices:.*?urgent=(\d+).*?optimistic=(\d+)")
 
 
@@ -55,6 +64,11 @@ def main():
         i = args.index("--evictions")
         evictions_path = args[i + 1]
         del args[i : i + 2]
+    # --from-now: start at the logs' current end instead of replaying them —
+    # lets a tailer restart mid-run without re-emitting the whole history.
+    from_now = "--from-now" in args
+    if from_now:
+        args.remove("--from-now")
     if len(args) < 2:
         sys.exit("usage: live-trace-tailer.py [--evictions <path>] <out.ndjson> <node.log> [<node.log> ...]")
     out_path = args[0]
@@ -63,6 +77,16 @@ def main():
     handles = {p: None for p in log_paths}
     state = {p: {"rb": 0, "eb": 0, "qu": 0, "qo": 0} for p in log_paths}
     block_index = 0
+    if from_now:
+        # Resuming mid-run: continue the block numbering where the stream
+        # left off, so the dashboard's "latest block" stays the latest.
+        try:
+            with open(out_path) as prior:
+                for line in prior:
+                    if line.strip():
+                        block_index = max(block_index, json.loads(line).get("i", 0))
+        except (FileNotFoundError, ValueError):
+            pass
     ev_index = 0
     node1 = log_paths[0]  # count one node's mempool to avoid triple-counting
     # NOTE: the stream files are truncated once by the run script at launch;
@@ -188,6 +212,8 @@ def main():
             if handle is None:
                 try:
                     handle = handles[p] = open(p, "r")
+                    if from_now:
+                        handle.seek(0, 2)
                 except FileNotFoundError:
                     continue
             # Survive log rotation/truncation.
@@ -343,10 +369,29 @@ def main():
                 state[p]["rb"], state[p]["eb"] = int(lane.group(1)), int(lane.group(2))
                 state[p]["rbBytes"] = int(lane.group(3)) if lane.group(3) else None
                 state[p]["ebBytes"] = int(lane.group(4)) if lane.group(4) else None
+                state[p]["ebHeld"] = lane.group(5) == "true" if lane.group(5) else None
                 continue
             queue = QUEUE_RE.search(line)
             if queue:
                 state[p]["qu"], state[p]["qo"] = int(queue.group(1)), int(queue.group(2))
+                if queue.group(3) is not None:
+                    qu_bytes, qu_cap = int(queue.group(3)), int(queue.group(4))
+                    qo_bytes, qo_cap = int(queue.group(6)), int(queue.group(7))
+                    qu_secs, qo_secs = float(queue.group(5)), float(queue.group(8))
+                    qu_time_budget = MEMPOOL_TIME_BUDGET_S * URGENT_TIME_SHARE
+                    qo_time_budget = MEMPOOL_TIME_BUDGET_S * (1 - URGENT_TIME_SHARE)
+                    state[p]["pool"] = {
+                        "quBytePct": round(100 * qu_bytes / qu_cap, 1) if qu_cap else None,
+                        "quTimePct": round(100 * qu_secs / qu_time_budget, 1),
+                        "qoBytePct": round(100 * qo_bytes / qo_cap, 1) if qo_cap else None,
+                        "qoTimePct": round(100 * qo_secs / qo_time_budget, 1),
+                        # raw values so the dashboard can print the actual
+                        # limits, not just percentages
+                        "quBytes": qu_bytes, "quCap": qu_cap,
+                        "quSecs": round(qu_secs, 2), "quBudgetS": qu_time_budget,
+                        "qoBytes": qo_bytes, "qoCap": qo_cap,
+                        "qoSecs": round(qo_secs, 2), "qoBudgetS": qo_time_budget,
+                    }
                 continue
             price = PRICE_RE.search(line)
             if price:
@@ -361,6 +406,8 @@ def main():
                     # and thin txs mix)
                     "rbBytes": state[p].get("rbBytes"),
                     "ebBytes": state[p].get("ebBytes"),
+                    "ebHeld": state[p].get("ebHeld"),
+                    "pool": state[p].get("pool"),
                     "qu": state[p]["qu"],
                     "qo": state[p]["qo"],
                     # the EB forged in this round, if any — joins against
