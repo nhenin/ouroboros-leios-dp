@@ -102,7 +102,7 @@ stop_everything() {
   trap - INT TERM EXIT
   echo ""
   echo "Stopping live demo (feeders, tailer, web server, devnet)..."
-  for pid in "$optimistic_feeder_pid" "$urgent_feeder_pid" "$actor_feeder_pid" "$aggregator_pid" "$conflict_feeder_pid" "$evict_aggregator_pid" "$eviction_controller_pid" "$tailer_pid" "$http_pid"; do
+  for pid in "$optimistic_feeder_pid" "$urgent_feeder_pid" "$actor_feeder_pid" "$aggregator_pid" "$conflict_feeder_pid" "$evict_aggregator_pid" "$eviction_controller_pid" "$watchdog_pid" "$tailer_pid" "$http_pid"; do
     [ -n "$pid" ] && kill "$pid" >/dev/null 2>&1 || true
   done
   # The dashboard-controlled eviction generators run under the controller subshell;
@@ -142,6 +142,7 @@ rm -f "$RUN_LOG"
 : >"$ACTOR_STREAM"
 : >"$EVICT_STREAM"
 : >"${DEMO_DIR}/removed-txs.ndjson"
+: >"${DEMO_DIR}/evicted-txs.ndjson"
 rm -f "$QUOTES_FILE"
 rm -f "${DEMO_DIR}/leios-status.json"
 rm -f "${DEMO_DIR}/lifecycle.json"
@@ -205,10 +206,16 @@ echo "node1 reached the Dijkstra era."
 # down cleanly, so we never get two writers appending to the same stream.
 pkill -f "live-trace-tailer.py" >/dev/null 2>&1 || true
 pkill -f "actor-aggregator.py" >/dev/null 2>&1 || true
+pkill -f "eviction-aggregator.py" >/dev/null 2>&1 || true
+pkill -f "demo-server.py" >/dev/null 2>&1 || true
+# Nothing else may sit on the dashboard port: a stray file server would keep
+# serving the page while silently swallowing every command (read-only trap).
+lsof -ti tcp:"$HTTP_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
 sleep 1
 : >"$LIVE_STREAM"
 : >"$ACTOR_STREAM"
 : >"${DEMO_DIR}/removed-txs.ndjson"
+: >"${DEMO_DIR}/evicted-txs.ndjson"
 
 # Stream every node's forge traces into the dashboard's live feed. Each block is
 # forged by exactly one node, so merging the three logs gives the full sequence.
@@ -406,7 +413,13 @@ eviction_controller() {
           # burst's own full blocks price it out within ~2 blocks. A fixed
           # bid only works for one price regime; this works in all of them.
           t1_bid="$T1_BID"
-          if [ "$t1_bid" = "auto" ]; then
+          # A silent restart of the SAME scenario keeps its original bid: the
+          # burst's own full blocks push the quote up, and recomputing 1.35x at
+          # the climbed quote every relaunch would ratchet the bid upward and
+          # never let the crossing happen.
+          if [ "$t1_bid" = "auto" ] && [ "${CURRENT_T1_BID:-0}" != "0" ] && [ "${RELAUNCH_SAME:-0}" = "1" ]; then
+            t1_bid="$CURRENT_T1_BID"
+          elif [ "$t1_bid" = "auto" ]; then
             t1_bid=$(python3 -c "
 import json, sys
 try:
@@ -449,6 +462,7 @@ print(max(1500000, quote * size * 27 // 20))
       fi
       current="$want"
       [ "$current" = "type1" ] || CURRENT_T1_BID=0
+      RELAUNCH_SAME=0
       write_run_config "$current"
     elif [ "$current" = "type3" ]; then
       : # flag-file scenario: nothing to babysit
@@ -457,6 +471,7 @@ print(max(1500000, quote * size * 27 // 20))
         # The generator died (e.g. its first tx raced an in-flight one). Relaunch
         # from the fund's current UTxO on the next pass.
         echo "(eviction generator $current stopped — relaunching)"
+        RELAUNCH_SAME=1
         current="off"
       else
         # Progress watchdog: a generator stuck retrying a doomed first submission
@@ -471,6 +486,7 @@ print(max(1500000, quote * size * 27 // 20))
             kill "$pid" >/dev/null 2>&1 || true
             [ -n "$agg_pid" ] && kill "$agg_pid" >/dev/null 2>&1 || true
             pid=""; agg_pid=""; stall_count=0
+            RELAUNCH_SAME=1
             current="off"
           fi
         else
@@ -483,6 +499,33 @@ print(max(1500000, quote * size * 27 // 20))
 }
 
 write_run_config "off"
+# Watchdog: the demo's plumbing must outlive its own crashes. The actor feeder
+# already restarts itself; give the tailer, the web server and the actor
+# aggregator the same courtesy — a silently dead one freezes half the page.
+plumbing_watchdog() {
+  while :; do
+    sleep 10
+    if ! kill -0 "$tailer_pid" >/dev/null 2>&1; then
+      echo "(tailer died — restarting, resuming block numbering)"
+      python3 "$SOURCE_DIR/live-trace-tailer.py" --from-now --evictions "$EVICT_STREAM" "$LIVE_STREAM" \
+        "$WORKING_DIR/node1/node.log" "$WORKING_DIR/node2/node.log" "$WORKING_DIR/node3/node.log" &
+      tailer_pid=$!
+    fi
+    if ! kill -0 "$http_pid" >/dev/null 2>&1; then
+      echo "(demo server died — restarting)"
+      python3 "$SOURCE_DIR/demo-server.py" "$HTTP_PORT" "$DEMO_DIR" "$ACTOR_CONFIG" "$WORKING_DIR" >/dev/null 2>&1 &
+      http_pid=$!
+    fi
+    if [ -n "$aggregator_pid" ] && ! kill -0 "$aggregator_pid" >/dev/null 2>&1; then
+      echo "(actor aggregator died — restarting)"
+      python3 "$SOURCE_DIR/actor-aggregator.py" "$WORKING_DIR/actor-feeder.log" "$ACTOR_STREAM" &
+      aggregator_pid=$!
+    fi
+  done
+}
+plumbing_watchdog &
+watchdog_pid=$!
+
 eviction_controller &
 eviction_controller_pid=$!
 

@@ -53,6 +53,16 @@ PRICE_RE = re.compile(r"forge prices:.*?urgent=(\d+).*?optimistic=(\d+)")
 # (supplied) vs what the lane charges for it at the crossing (expected).
 MISMATCH_RE = re.compile(r"supplied: Coin (\d+), expected: Coin (\d+)")
 
+# Python 3.9's fromisoformat only takes fractional seconds of exactly 3 or 6
+# digits; the node emits variable-length fractions. Normalise to 6.
+ISO_FRAC_RE = re.compile(r"\.(\d+)")
+
+
+def parse_iso(ts):
+    ts = ts.replace("Z", "+00:00")
+    ts = ISO_FRAC_RE.sub(lambda m: "." + (m.group(1) + "000000")[:6], ts, count=1)
+    return datetime.fromisoformat(ts)
+
 
 def main():
     args = sys.argv[1:]
@@ -79,13 +89,19 @@ def main():
     block_index = 0
     if from_now:
         # Resuming mid-run: continue the block numbering where the stream
-        # left off, so the dashboard's "latest block" stays the latest.
+        # left off (NEXT index, the emit site post-increments), and never let
+        # one torn line abort the scan and reset the numbering.
         try:
             with open(out_path) as prior:
                 for line in prior:
-                    if line.strip():
-                        block_index = max(block_index, json.loads(line).get("i", 0))
-        except (FileNotFoundError, ValueError):
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue  # torn/partial line - skip, keep scanning
+                    block_index = max(block_index, rec.get("i", -1) + 1)
+        except FileNotFoundError:
             pass
     ev_index = 0
     node1 = log_paths[0]  # count one node's mempool to avoid triple-counting
@@ -347,9 +363,7 @@ def main():
                             waited = None
                             if seen and removed_at:
                                 try:
-                                    t0 = datetime.fromisoformat(seen.replace("Z", "+00:00"))
-                                    t1 = datetime.fromisoformat(removed_at.replace("Z", "+00:00"))
-                                    waited = round((t1 - t0).total_seconds(), 1)
+                                    waited = round((parse_iso(removed_at) - parse_iso(seen)).total_seconds(), 1)
                                 except Exception:
                                     pass
                             details.append({

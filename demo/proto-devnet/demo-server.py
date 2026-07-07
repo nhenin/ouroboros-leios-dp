@@ -70,11 +70,14 @@ def main():
                         pass
                 if lane in ("urgent", "optimistic"):
                     for node in ("node1", "node2", "node3"):
-                        flag = os.path.join(working_dir, node, "flush-lane")
-                        tmp = flag + ".tmp"
-                        with open(tmp, "w") as handle:
-                            handle.write(lane)
-                        os.replace(tmp, flag)
+                        try:
+                            flag = os.path.join(working_dir, node, "flush-lane")
+                            tmp = flag + ".tmp"
+                            with open(tmp, "w") as handle:
+                                handle.write(lane)
+                            os.replace(tmp, flag)
+                        except OSError:
+                            pass  # node dir not there (devnet down) - flush what exists
                 else:
                     subprocess.run(["pkill", "-f", "cardano-node run"], check=False)
                 self._send_json(200, b'{"ok":true}')
@@ -112,7 +115,7 @@ def main():
                 except Exception as exc:  # noqa: BLE001 - report any parse error to the caller
                     self._send_json(400, json.dumps({"error": str(exc)}).encode())
                     return
-                tmp = target + ".tmp"
+                tmp = "%s.%d.tmp" % (target, os.getpid())  # unique per writer: two tabs can't tear one tmp
                 with open(tmp, "w") as handle:
                     json.dump(config, handle)
                 os.replace(tmp, target)

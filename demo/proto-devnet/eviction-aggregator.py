@@ -60,7 +60,11 @@ def main():
         if not line:
             time.sleep(0.25)
             continue
-        if "(conflicting) ->" not in line:
+        # type1 (price squeeze) door refusals carry no "(conflicting)" marker —
+        # they read "<n>: rejected ... : ...BidBelowQuote..." straight from the
+        # burst feeder. Count them too: a squeeze that only bounces at the door
+        # otherwise shows an empty journal.
+        if "(conflicting) ->" not in line and not ("rejected" in line and "BidBelowQuote" in line):
             continue
         bid, spent, other = classify(line)
         # The feeder logs which lane the losing tx bought ("N: urgent ..." /
