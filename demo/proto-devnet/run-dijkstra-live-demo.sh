@@ -102,7 +102,7 @@ stop_everything() {
   trap - INT TERM EXIT
   echo ""
   echo "Stopping live demo (feeders, tailer, web server, devnet)..."
-  for pid in "$optimistic_feeder_pid" "$urgent_feeder_pid" "$actor_feeder_pid" "$aggregator_pid" "$conflict_feeder_pid" "$evict_aggregator_pid" "$eviction_controller_pid" "$watchdog_pid" "$tailer_pid" "$http_pid"; do
+  for pid in "$optimistic_feeder_pid" "$urgent_feeder_pid" "$actor_feeder_pid" "$aggregator_pid" "$conflict_feeder_pid" "$evict_aggregator_pid" "$eviction_controller_pid" "$watchdog_pid" "$tailer_pid" "$http_pid" "${http_public_pid:-}"; do
     [ -n "$pid" ] && kill "$pid" >/dev/null 2>&1 || true
   done
   # The dashboard-controlled eviction generators run under the controller subshell;
@@ -237,6 +237,14 @@ printf '{"mode":"off"}\n' >"$EVICTION_CONTROL"
 # poll it from the same origin.
 python3 "$SOURCE_DIR/demo-server.py" "$HTTP_PORT" "$DEMO_DIR" "$ACTOR_CONFIG" "$WORKING_DIR" >/dev/null 2>&1 &
 http_pid=$!
+
+# The audience copy: same dashboard, same live streams, commands refused —
+# the page shows "watching mode". Tunnel THIS port to share the demo;
+# the presenter keeps driving through $HTTP_PORT.
+: "${HTTP_PUBLIC_PORT:=8781}"
+lsof -ti tcp:"$HTTP_PUBLIC_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+python3 "$SOURCE_DIR/demo-server.py" --read-only "$HTTP_PUBLIC_PORT" "$DEMO_DIR" "$ACTOR_CONFIG" "$WORKING_DIR" >/dev/null 2>&1 &
+http_public_pid=$!
 
 run_feeder_forever() {
   local label fund_index optimistic_first urgent_after feeder_log
@@ -515,6 +523,11 @@ plumbing_watchdog() {
       echo "(demo server died — restarting)"
       python3 "$SOURCE_DIR/demo-server.py" "$HTTP_PORT" "$DEMO_DIR" "$ACTOR_CONFIG" "$WORKING_DIR" >/dev/null 2>&1 &
       http_pid=$!
+    fi
+    if [ -n "${http_public_pid:-}" ] && ! kill -0 "$http_public_pid" >/dev/null 2>&1; then
+      echo "(audience server died — restarting)"
+      python3 "$SOURCE_DIR/demo-server.py" --read-only "$HTTP_PUBLIC_PORT" "$DEMO_DIR" "$ACTOR_CONFIG" "$WORKING_DIR" >/dev/null 2>&1 &
+      http_public_pid=$!
     fi
     if [ -n "$aggregator_pid" ] && ! kill -0 "$aggregator_pid" >/dev/null 2>&1; then
       echo "(actor aggregator died — restarting)"

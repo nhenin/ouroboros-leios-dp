@@ -19,12 +19,20 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 
 def main():
-    if len(sys.argv) not in (4, 5):
-        sys.exit("usage: demo-server.py <port> <dir> <config-path> [<devnet-working-dir>]")
-    port = int(sys.argv[1])
-    directory = sys.argv[2]
-    config_path = sys.argv[3]
-    working_dir = sys.argv[4] if len(sys.argv) == 5 else "/tmp/dijkstra-live-demo"
+    args = sys.argv[1:]
+    # --read-only: the audience copy. Serves every live stream but refuses
+    # every command with an explicit marker, so the page shows "watching
+    # mode" instead of failing quietly. One presenter drives (full server),
+    # everyone else watches this one.
+    read_only = "--read-only" in args
+    if read_only:
+        args.remove("--read-only")
+    if len(args) not in (3, 4):
+        sys.exit("usage: demo-server.py [--read-only] <port> <dir> <config-path> [<devnet-working-dir>]")
+    port = int(args[0])
+    directory = args[1]
+    config_path = args[2]
+    working_dir = args[3] if len(args) == 4 else "/tmp/dijkstra-live-demo"
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
@@ -54,6 +62,9 @@ def main():
             return super().do_GET()
 
         def do_POST(self):
+            if read_only:
+                self._send_json(403, b'{"error":"read-only","readOnly":true}')
+                return
             if self.path.rstrip("/") == "/flush-queues":
                 # Flush a chosen lane, or both. One lane: raise each node's
                 # flag file — the node's watcher removes that lane's waiting
