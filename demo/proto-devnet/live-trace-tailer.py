@@ -87,6 +87,11 @@ def main():
     handles = {p: None for p in log_paths}
     state = {p: {"rb": 0, "eb": 0, "qu": 0, "qo": 0} for p in log_paths}
     block_index = 0
+    # Praos slot battle: two nodes forge for the same slot and BOTH trace a
+    # forge — same prices, same fills, seconds apart. One chain block must be
+    # one dashboard block, so an identical fingerprint within the battle
+    # window is the same block seen twice, not a new one.
+    last_forge = {"fp": None, "ts": None}
     if from_now:
         # Resuming mid-run: continue the block numbering where the stream
         # left off (NEXT index, the emit site post-increments), and never let
@@ -188,6 +193,23 @@ def main():
                 out.write(json.dumps(r) + "\n")
             out.flush()
 
+    # The squeeze's own bid, read live from run-config.json (same dir): lets
+    # the streams tag which priced-out txs are the burst's and which are the
+    # crowd's collateral — the journal must not sell one as the other.
+    run_config_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), "run-config.json")
+    t1_bid_cache = {"bid": 0, "read": 0.0}
+
+    def current_t1_bid():
+        now = time.time()
+        if now - t1_bid_cache["read"] > 5:
+            t1_bid_cache["read"] = now
+            try:
+                with open(run_config_path) as f:
+                    t1_bid_cache["bid"] = int(json.load(f).get("t1Bid") or 0)
+            except Exception:
+                pass
+        return t1_bid_cache["bid"]
+
     # Per-eviction DETAIL stream: one line per priced-out tx with the exact
     # numbers the ledger judged (its bid vs what the lane now charges for it)
     # and how long it waited (admission time joined by txid prefix). The
@@ -264,6 +286,22 @@ def main():
                     continue
                 except Exception:
                     pass
+            if p == node1 and "ManuallyRemovedTxs" in line:
+                # The lane-flush control removes txs through the mempool API —
+                # without this, flushed txs stay "waiting" in the journals
+                # forever. Short txids only; stage "flushed".
+                try:
+                    inner = json.loads(json.loads(line)["message"])
+                    data = inner.get("data") or {}
+                    txs = data.get("txsRemoved") or []
+                    emit_removed([{"txid": (t or "")[:8], "stage": "flushed", "lane": "?"}
+                                  for t in txs if t])
+                    size = data.get("mempoolSize") or {}
+                    if size:
+                        write_mempool_live(size, inner.get("at"))
+                except Exception:
+                    pass
+                continue
             if p == node1 and "Mempool.AddedTx" in line:
                 try:
                     inner = json.loads(json.loads(line)["message"])
@@ -318,10 +356,13 @@ def main():
                                 })
                             b = buckets.setdefault(
                                 stage,
-                                {"n": 0, "urgent": 0, "optimistic": 0, "bid": 0, "spent": 0},
+                                {"n": 0, "urgent": 0, "optimistic": 0, "bid": 0, "spent": 0, "burst": 0},
                             )
                             b["n"] += 1
                             b["bid"] += 1 if priced else 0
+                            if priced and bid_required and current_t1_bid() \
+                                    and int(bid_required.group(1)) == current_t1_bid():
+                                b["burst"] += 1
                             b["spent"] += 1 if "AllInputsAreSpent" in blob else 0
                             if "dtbrInclusion = Urgent" in blob:
                                 b["urgent"] += 1
@@ -333,6 +374,9 @@ def main():
                                 "n": b["n"],
                                 "urgent": b["urgent"], "optimistic": b["optimistic"],
                                 "bidBelowQuote": b["bid"], "allInputsAreSpent": b["spent"],
+                                # the squeeze's OWN txs among the priced-out —
+                                # the rest is the crowd's collateral
+                                "burstBidBelowQuote": b.get("burst", 0),
                                 "other": max(0, b["n"] - b["bid"] - b["spent"]),
                                 "mempoolTxs": mempool_txs,
                             })
@@ -366,10 +410,12 @@ def main():
                                     waited = round((parse_iso(removed_at) - parse_iso(seen)).total_seconds(), 1)
                                 except Exception:
                                     pass
+                            t1 = current_t1_bid()
                             details.append({
                                 "txid": e["txid"], "stage": e["stage"], "lane": e["lane"],
                                 "t": removed_at, "addedAt": seen, "waitedS": waited,
                                 "bid": e.get("bid"), "required": e.get("required"),
+                                "burst": bool(t1) and e.get("bid") == t1,
                             })
                         emit_evicted_detail(details)
                         handled = True
@@ -409,6 +455,18 @@ def main():
                 continue
             price = PRICE_RE.search(line)
             if price:
+                fp = (price.group(1), price.group(2), state[p]["rb"], state[p]["eb"],
+                      state[p].get("rbBytes"), state[p].get("ebBytes"))
+                # the trace's "at" lives INSIDE the escaped message payload —
+                # a raw regex on the outer line never matches (verified live)
+                try:
+                    ts = parse_iso(json.loads(json.loads(line)["message"])["at"]).timestamp()
+                except Exception:
+                    ts = None
+                if (fp == last_forge["fp"] and ts is not None and last_forge["ts"] is not None
+                        and abs(ts - last_forge["ts"]) < 1.5):
+                    continue  # the same slot's battle twin — skip it
+                last_forge["fp"], last_forge["ts"] = fp, ts
                 record = {
                     "i": block_index,
                     "urgent": int(price.group(1)),
