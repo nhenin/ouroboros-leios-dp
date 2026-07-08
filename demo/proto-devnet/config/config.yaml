@@ -6,7 +6,14 @@ ConwayGenesisFile: conway-genesis.json
 DijkstraGenesisFile: dijkstra-genesis.json
 
 # Lower bound, 2 * maxEBClosure (12.5MB)
-MempoolCapacityBytesOverride: 25000000
+MempoolCapacityBytesOverride: 130000000
+# Mempool diffusion timeouts: the node wants the trio all-set or all-unset.
+# Soft/hard keep their defaults; the CAPACITY is the demo knob — the lanes
+# split it 1/9 urgent (a short window, same behaviour as the old default) /
+# 8/9 patient (many endorser blocks' worth of buffer).
+MempoolTimeoutSoft: 1
+MempoolTimeoutHard: 1.5
+MempoolTimeoutCapacity: 15
 
 # Needed < 10.6
 EnableP2P: true

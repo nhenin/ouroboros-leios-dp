@@ -88,6 +88,8 @@ aggregator_pid=""
 conflict_feeder_pid=""
 evict_aggregator_pid=""
 eviction_controller_pid=""
+watchdog_pid=""
+http_public_pid=""
 
 compose_file="${WORKING_DIR}/process-compose.no-tx-centrifuge.yaml"
 
@@ -582,6 +584,20 @@ while kill -0 "$devnet_pid" >/dev/null 2>&1; do
       fi
       if line=$(fund_largest_utxo 2) && [ -n "$line" ]; then
         restart_args+=(--initial-txin-2 "${line%% *}" --initial-value-2 "${line##* }")
+      fi
+      # Rapid death loop = the old incarnation's in-flight txs are wedged in
+      # the patient pool (min-fill keeps them pooling, they lock the fund's
+      # heads, every new chain dies at the door). Clear that lane once after
+      # a few consecutive fast deaths, then re-anchor as usual.
+      feeder_deaths=$(( ${feeder_deaths:-0} + 1 ))
+      if [ "$feeder_deaths" -ge 3 ]; then
+        echo "(feeder died $feeder_deaths times in a row — clearing the patient lane to unwedge its old txs)"
+        for n in node1 node2 node3; do
+          printf 'optimistic' >"$WORKING_DIR/$n/flush-lane.tmp" 2>/dev/null \
+            && mv "$WORKING_DIR/$n/flush-lane.tmp" "$WORKING_DIR/$n/flush-lane" 2>/dev/null || true
+        done
+        feeder_deaths=0
+        sleep 5
       fi
       echo "(actor feeder: re-anchoring on current UTxOs and restarting)"
       start_actor_feeder "${restart_args[@]}"

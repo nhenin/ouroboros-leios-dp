@@ -65,6 +65,16 @@ def main():
             if read_only:
                 self._send_json(403, b'{"error":"read-only","readOnly":true}')
                 return
+            if self.path.rstrip("/") == "/restart-network":
+                # Full restart: fresh chain, every component relaunched. The
+                # launcher survives this server's own death (new session).
+                launcher = "/Users/nhenin/dev/ARC/stream-tiers-pricing/launch-demo.sh"
+                self._send_json(200, b'{"ok":true,"restarting":true}')
+                subprocess.Popen(["nohup", "bash", launcher],
+                                 stdout=open("/tmp/demo-restart.log", "w"),
+                                 stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+                return
             if self.path.rstrip("/") == "/flush-queues":
                 # Flush a chosen lane, or both. One lane: raise each node's
                 # flag file — the node's watcher removes that lane's waiting
