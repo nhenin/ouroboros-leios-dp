@@ -123,10 +123,11 @@ def main():
     leios_status_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), "leios-status.json")
     eb_forged = {}     # ebHash -> {"slot", "numTxs"}
     eb_certified = set()
-    # Certificates that just landed and have not yet been attributed to a
-    # block record: the NEXT emitted block is the one whose pricing counts
-    # the endorser block's usage — say so in the stream.
-    cert_pending = []
+    # Certificate landings keyed by the certifying block's slot (atSlot from the
+    # trace). The LeiosBlockCertified trace fires a beat AFTER that block's own
+    # forge-prices, so the block's record is held pending and stamped from here —
+    # certification shows on the block that actually certified, not the next one.
+    cert_by_slot = {}
 
     def write_leios_status():
         # "Stalled" = uncertified AND newer than the last certified EB. An older
@@ -162,6 +163,9 @@ def main():
     def flush_pending(p_):
         pending = state[p_].pop("pending", None)
         if pending is not None:
+            # A certificate for this block may have landed while it waited.
+            if pending.get("certIn") is None:
+                pending["certIn"] = cert_by_slot.pop(pending.get("slot"), None)
             emit(pending)
 
     def emit_eviction(record):
@@ -287,9 +291,24 @@ def main():
                         write_leios_status()
                     elif kind == "LeiosBlockCertified":
                         h = data.get("ebHash", "")
+                        at_slot = data.get("atSlot")
                         if h and h not in eb_certified:
-                            cert_pending.append({"hash": h[:8],
-                                                 "numTxs": eb_forged.get(h, {}).get("numTxs", 0)})
+                            info = {"hash": h[:8],
+                                    "numTxs": eb_forged.get(h, {}).get("numTxs", 0)}
+                            # This certifying block's record is held pending on
+                            # this node (its forge-prices came a beat earlier) —
+                            # stamp and release it now, so certification lands on
+                            # the very block that certified.
+                            pending = state[p].get("pending")
+                            if pending is not None and pending.get("slot") == at_slot:
+                                pending["certIn"] = info
+                                emit(pending)
+                                state[p]["pending"] = None
+                            else:
+                                cert_by_slot[at_slot] = info
+                                if len(cert_by_slot) > 50:  # unmatched — don't leak
+                                    for k in sorted(cert_by_slot)[:25]:
+                                        del cert_by_slot[k]
                         eb_certified.add(h)
                         write_leios_status()
                     continue
@@ -432,6 +451,20 @@ def main():
                     pass
                 if handled:
                     continue
+            if "NodeIsLeader" in line:
+                # The forging slot for THIS round: NodeIsLeader fires with the
+                # slot just before the forge-lanes/prices traces, so it is set
+                # by the time this round's block record is emitted. The dashboard
+                # differences consecutive slots to show the gap between blocks
+                # (which the 10-slot certification gap is measured against).
+                try:
+                    inner = json.loads(json.loads(line)["message"])
+                    sl = (inner.get("data") or {}).get("slot")
+                    if sl is not None:
+                        state[p]["leaderSlot"] = int(sl)
+                except Exception:
+                    pass
+                continue
             lane = LANE_RE.search(line)
             if lane:
                 flush_pending(p)   # a new round starts: whatever was pending is final
@@ -478,6 +511,10 @@ def main():
                 last_forge["fp"], last_forge["ts"] = fp, ts
                 record = {
                     "i": block_index,
+                    # the slot this block was forged in (from NodeIsLeader); the
+                    # dashboard differences consecutive slots for the gap between
+                    # blocks — what the 10-slot certification gap is measured on
+                    "slot": state[p].get("leaderSlot"),
                     "urgent": int(price.group(1)),
                     "optimistic": int(price.group(2)),
                     "rb": state[p]["rb"],
@@ -488,9 +525,10 @@ def main():
                     "rbBytes": state[p].get("rbBytes"),
                     "ebBytes": state[p].get("ebBytes"),
                     "ebHeld": state[p].get("ebHeld"),
-                    # the certificate(s) carried around this block: THIS is the
-                    # round whose pricing counts that endorser block's usage
-                    "certIn": cert_pending.pop(0) if cert_pending else None,
+                    # the certificate this block counts (stamped by slot when the
+                    # LeiosBlockCertified trace lands; usually attached while this
+                    # record is held pending, just below)
+                    "certIn": cert_by_slot.pop(state[p].get("leaderSlot"), None),
                     "pool": state[p].get("pool"),
                     "qu": state[p]["qu"],
                     "qo": state[p]["qo"],
@@ -503,14 +541,12 @@ def main():
                     "node": os.path.basename(os.path.dirname(p)),
                 }
                 block_index += 1
-                if record["eb"] > 0 and record["ebHash"] is None:
-                    # The LeiosBlockForged trace for this round has not been read
-                    # yet (trace ordering varies). Hold the record briefly so the
-                    # EB hash can be attached — the dashboard joins certification
-                    # state by that hash.
-                    state[p]["pending"] = record
-                else:
-                    emit(record)
+                # Hold every record a beat before emitting: both its EB hash
+                # (LeiosBlockForged) and its certificate (LeiosBlockCertified)
+                # trace JUST AFTER this forge-prices line, so holding lets them
+                # attach to THIS block instead of the next. Released by those
+                # traces, by the next round's forge-lanes, or on idle.
+                state[p]["pending"] = record
         if not progressed:
             for p_ in log_paths:
                 flush_pending(p_)
