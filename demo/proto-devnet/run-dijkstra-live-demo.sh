@@ -145,6 +145,7 @@ rm -f "$RUN_LOG"
 : >"$EVICT_STREAM"
 : >"${DEMO_DIR}/removed-txs.ndjson"
 : >"${DEMO_DIR}/evicted-txs.ndjson"
+: >"${DEMO_DIR}/dropped-txs.ndjson"
 rm -f "$QUOTES_FILE"
 rm -f "${DEMO_DIR}/leios-status.json"
 rm -f "${DEMO_DIR}/lifecycle.json"
@@ -218,6 +219,7 @@ sleep 1
 : >"$ACTOR_STREAM"
 : >"${DEMO_DIR}/removed-txs.ndjson"
 : >"${DEMO_DIR}/evicted-txs.ndjson"
+: >"${DEMO_DIR}/dropped-txs.ndjson"
 
 # Stream every node's forge traces into the dashboard's live feed. Each block is
 # forged by exactly one node, so merging the three logs gives the full sequence.
@@ -533,7 +535,10 @@ plumbing_watchdog() {
     fi
     if [ -n "$aggregator_pid" ] && ! kill -0 "$aggregator_pid" >/dev/null 2>&1; then
       echo "(actor aggregator died — restarting)"
-      python3 "$SOURCE_DIR/actor-aggregator.py" "$WORKING_DIR/actor-feeder.log" "$ACTOR_STREAM" &
+      # Same flags as the boot launch — a bare respawn used to silently lose
+      # the lifecycle join (frozen journals until the next full restart).
+      python3 "$SOURCE_DIR/actor-aggregator.py" "$WORKING_DIR/actor-feeder.log" "$ACTOR_STREAM" "$ACTOR_BUCKET" \
+        --removed "$DEMO_DIR/removed-txs.ndjson" --lifecycle "$DEMO_DIR/lifecycle.json" &
       aggregator_pid=$!
     fi
   done

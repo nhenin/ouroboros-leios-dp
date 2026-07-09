@@ -16,17 +16,26 @@ dashboard can show how the urgent / optimistic / walk-away split shifts.
 Lifecycle (new): every decision belongs to a "generation" — the cockpit command
 label active when it was made (the feeder stamps gen=<label>). We join:
   - decisions        -> sent counts per generation (and lane / walk-away split)
-  - accepted lines   -> txid prefix -> generation
-  - removed-txs.ndjson (from live-trace-tailer) -> per-tx "cleared" (the tx
-    landed on-chain; its mempool copy was housekept away) or "evicted" (priced
-    out) — attributed back to the generation via the txid prefix
+  - accepted lines   -> txid prefix -> generation AND lane (the feeder's own
+    record — authoritative even when a removal line can't tell the lane)
+  - removed-txs.ndjson (from live-trace-tailer) -> per-tx stage: "cleared" (the
+    tx landed on-chain; its mempool copy was housekept away), "evicted" (priced
+    out while waiting), "orphaned" (chained behind an evicted tx) or "flushed"
+    (dropped by hand via the presenter's flush command) — attributed back to
+    the generation via the txid prefix. Every drop kind is counted separately
+    and split per lane, so the journal can say WHY a tx never made it, not just
+    that it didn't.
 and periodically snapshot lifecycle.json: per generation, how many txs were
 sent, accepted, are still waiting in the mempool, landed in a block, or were
-dropped. That is what lets the dashboard show the latency between a cockpit
-command and its visible effect.
+dropped (and how). That is what lets the dashboard show the latency between a
+cockpit command and its visible effect.
 
 Usage: actor-aggregator.py <feeder.log> <out.ndjson> [bucket-size]
                            [--removed <removed-txs.ndjson>] [--lifecycle <lifecycle.json>]
+
+--removed and --lifecycle default to <out dir>/removed-txs.ndjson and
+<out dir>/lifecycle.json — the whole plumbing writes into one demo dir, so a
+bare respawn (watchdog) keeps the full lifecycle alive.
 """
 
 import json
@@ -80,6 +89,21 @@ def main():
         sys.exit("usage: actor-aggregator.py <feeder.log> <out.ndjson> [bucket-size] [--removed f] [--lifecycle f]")
     log_path, out_path = args[0], args[1]
     bucket_size = int(args[2]) if len(args) > 2 else 120
+    demo_dir = os.path.dirname(os.path.abspath(out_path))
+    if removed_path is None:
+        removed_path = os.path.join(demo_dir, "removed-txs.ndjson")
+    if lifecycle_path is None:
+        lifecycle_path = os.path.join(demo_dir, "lifecycle.json")
+    # Every dropped tx, attributed: txid -> generation + why. The dashboard
+    # joins this against the tailer's evicted-txs detail stream to tell each
+    # generation's drop story EXACTLY (time windows alone kidnap neighbours'
+    # evictions — a sweep near a boundary belongs to whoever sent the txs).
+    dropped_path = os.path.join(demo_dir, "dropped-txs.ndjson")
+    # This process replays its inputs from the start on every (re)launch, so
+    # its append-streams must start empty — a respawn would otherwise double
+    # every bucket and every drop.
+    open(out_path, "w").close()
+    open(dropped_path, "w").close()
 
     counts = {"urgent": 0, "optimistic": 0, "shed": 0}
     last_qu, last_qo = 704, 44
@@ -89,15 +113,18 @@ def main():
     # generation label -> lifecycle counters (insertion order = command order)
     generations = {}
     pending_gen = {}   # decision n -> generation (until its accepted line shows up)
-    tx_gen = {}        # txid 8-hex prefix -> generation
+    tx_gen = {}        # txid 8-hex prefix -> (generation, lane)
     last_snapshot = 0.0
 
     def gen_bucket(label):
         if label not in generations:
             generations[label] = {
                 "label": label, "sent": 0, "urgent": 0, "optimistic": 0, "shed": 0,
-                "accepted": 0, "forged": 0, "evicted": 0, "orphaned": 0,
+                "accepted": 0, "forged": 0, "evicted": 0, "orphaned": 0, "flushed": 0,
                 "acceptedUrgent": 0, "acceptedOptimistic": 0,
+                "evictedUrgent": 0, "evictedOptimistic": 0,
+                "orphanedUrgent": 0, "orphanedOptimistic": 0,
+                "flushedUrgent": 0, "flushedOptimistic": 0,
                 "doneUrgent": 0, "doneOptimistic": 0,
                 "firstSeen": time.time(), "lastSeen": time.time(),
             }
@@ -108,7 +135,8 @@ def main():
             return
         gens = list(generations.values())[-15:]
         for g in gens:
-            g["waiting"] = max(0, g["accepted"] - g["forged"] - g["evicted"] - g.get("orphaned", 0))
+            g["waiting"] = max(0, g["accepted"] - g["forged"] - g["evicted"]
+                               - g.get("orphaned", 0) - g.get("flushed", 0))
             g["waitingUrgent"] = max(0, g.get("acceptedUrgent", 0) - g.get("doneUrgent", 0))
             g["waitingOptimistic"] = max(0, g.get("acceptedOptimistic", 0) - g.get("doneOptimistic", 0))
         tmp = lifecycle_path + ".tmp"
@@ -170,7 +198,7 @@ def main():
                     g["acceptedUrgent"] += 1
                 else:
                     g["acceptedOptimistic"] += 1
-                tx_gen[txid[:8]] = label
+                tx_gen[txid[:8]] = (label, lane)
                 if len(tx_gen) > 300000:
                     for k in list(tx_gen)[:50000]:
                         del tx_gen[k]
@@ -181,22 +209,36 @@ def main():
                     rec = json.loads(line)
                 except ValueError:
                     continue
-                label = tx_gen.pop(rec.get("txid", ""), None)
-                if label is None:
+                entry = tx_gen.pop(rec.get("txid", ""), None)
+                if entry is None:
                     continue   # not an actor tx (scenario generators, other feeders)
+                label, lane = entry
+                # The feeder's own record of the lane is authoritative — a
+                # flushed-tx trace line only carries "?" for the lane.
+                if lane not in ("urgent", "optimistic"):
+                    lane = "urgent" if rec.get("lane") == "urgent" else "optimistic"
+                suffix = "Urgent" if lane == "urgent" else "Optimistic"
                 g = gen_bucket(label)
                 stage = rec.get("stage")
                 if stage == "evicted":
                     g["evicted"] += 1
+                    g["evicted" + suffix] += 1
                 elif stage == "orphaned":
                     # chained descendant of an evicted tx: dropped, never forged
                     g["orphaned"] += 1
+                    g["orphaned" + suffix] += 1
+                elif stage == "flushed":
+                    # dropped by hand (the presenter's flush command) — a drop,
+                    # never a forge: selling it as "forged" broke the story
+                    g["flushed"] += 1
+                    g["flushed" + suffix] += 1
                 else:
                     g["forged"] += 1
-                if rec.get("lane") == "urgent":
-                    g["doneUrgent"] += 1
-                else:
-                    g["doneOptimistic"] += 1
+                g["done" + suffix] += 1
+                if stage in ("evicted", "orphaned", "flushed"):
+                    with open(dropped_path, "a") as out:
+                        out.write(json.dumps({"txid": rec.get("txid"), "gen": label,
+                                              "stage": stage, "lane": lane}) + "\n")
         now = time.time()
         if now - last_snapshot > 1.0:
             snapshot()
