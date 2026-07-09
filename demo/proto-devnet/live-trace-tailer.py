@@ -123,6 +123,10 @@ def main():
     leios_status_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), "leios-status.json")
     eb_forged = {}     # ebHash -> {"slot", "numTxs"}
     eb_certified = set()
+    # Certificates that just landed and have not yet been attributed to a
+    # block record: the NEXT emitted block is the one whose pricing counts
+    # the endorser block's usage — say so in the stream.
+    cert_pending = []
 
     def write_leios_status():
         # "Stalled" = uncertified AND newer than the last certified EB. An older
@@ -282,7 +286,11 @@ def main():
                             state[p]["ebHash"] = data.get("hash", "")[:8]
                         write_leios_status()
                     elif kind == "LeiosBlockCertified":
-                        eb_certified.add(data.get("ebHash", ""))
+                        h = data.get("ebHash", "")
+                        if h and h not in eb_certified:
+                            cert_pending.append({"hash": h[:8],
+                                                 "numTxs": eb_forged.get(h, {}).get("numTxs", 0)})
+                        eb_certified.add(h)
                         write_leios_status()
                     continue
                 except Exception:
@@ -480,6 +488,9 @@ def main():
                     "rbBytes": state[p].get("rbBytes"),
                     "ebBytes": state[p].get("ebBytes"),
                     "ebHeld": state[p].get("ebHeld"),
+                    # the certificate(s) carried around this block: THIS is the
+                    # round whose pricing counts that endorser block's usage
+                    "certIn": cert_pending.pop(0) if cert_pending else None,
                     "pool": state[p].get("pool"),
                     "qu": state[p]["qu"],
                     "qo": state[p]["qo"],
