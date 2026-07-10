@@ -49,6 +49,17 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the node traces (Mempool.RemoveTxs) — the tailer captures it into evictions.ndjson.
 # Pair with a modest FEE (bid) and larger METADATA_BYTES so the RB saturates.
 : "${INDEPENDENT_FUNDING:=0}"
+# process-compose writes the node logs with no size limit. A long run used to
+# grow each node.log to ~19 GB and fill the disk, which killed the whole demo.
+# The janitor truncates any log past MAX_LOG_MB in place; the tailer and the
+# aggregators already resume from a truncated file. ABORT_FREE_GB is the last
+# line of defence: below it the demo shuts itself down rather than the machine.
+: "${MAX_LOG_MB:=512}"
+: "${MIN_FREE_GB:=20}"
+: "${ABORT_FREE_GB:=5}"
+# Poll often: a log overshoots its cap by (write rate x interval), and a chatty
+# trace level writes hundreds of MB per minute. du on one file is a stat.
+: "${LOG_JANITOR_POLL_S:=10}"
 
 RUN_LOG="${WORKING_DIR}.live-demo.log"
 
@@ -62,6 +73,15 @@ require_command() {
 require_command cardano-cli
 require_command jq
 require_command python3
+
+# A demo that starts on a nearly full disk dies mid-run and takes the machine
+# down with it. Refuse rather than discover it three hours in.
+free_gb="$(df -g "$(dirname "$WORKING_DIR")" | awk 'NR==2 {print $4}')"
+if [ "${free_gb:-0}" -lt "$MIN_FREE_GB" ]; then
+  echo "Only ${free_gb} GB free on $(dirname "$WORKING_DIR") — need ${MIN_FREE_GB} GB." >&2
+  echo "Free some space, or lower MIN_FREE_GB if you know what you are doing." >&2
+  exit 1
+fi
 
 if ! command -v "$LANE_FEEDER" >/dev/null 2>&1 && [ ! -x "$LANE_FEEDER" ]; then
   echo "Missing lane feeder executable: $LANE_FEEDER" >&2
@@ -89,6 +109,7 @@ conflict_feeder_pid=""
 evict_aggregator_pid=""
 eviction_controller_pid=""
 watchdog_pid=""
+log_janitor_pid=""
 http_public_pid=""
 
 compose_file="${WORKING_DIR}/process-compose.no-tx-centrifuge.yaml"
@@ -104,7 +125,7 @@ stop_everything() {
   trap - INT TERM EXIT
   echo ""
   echo "Stopping live demo (feeders, tailer, web server, devnet)..."
-  for pid in "$optimistic_feeder_pid" "$urgent_feeder_pid" "$actor_feeder_pid" "$aggregator_pid" "$conflict_feeder_pid" "$evict_aggregator_pid" "$eviction_controller_pid" "$watchdog_pid" "$tailer_pid" "$http_pid" "${http_public_pid:-}"; do
+  for pid in "$optimistic_feeder_pid" "$urgent_feeder_pid" "$actor_feeder_pid" "$aggregator_pid" "$conflict_feeder_pid" "$evict_aggregator_pid" "$eviction_controller_pid" "$watchdog_pid" "$log_janitor_pid" "$tailer_pid" "$http_pid" "${http_public_pid:-}"; do
     [ -n "$pid" ] && kill "$pid" >/dev/null 2>&1 || true
   done
   # The dashboard-controlled eviction generators run under the controller subshell;
@@ -545,6 +566,33 @@ plumbing_watchdog() {
 }
 plumbing_watchdog &
 watchdog_pid=$!
+
+# Keep the run's footprint bounded. Truncating in place (rather than removing)
+# frees the blocks immediately even though process-compose holds the file open,
+# and every reader here already recovers from a truncation.
+log_janitor() {
+  local max_kb=$((MAX_LOG_MB * 1024))
+  local f kb free
+  while :; do
+    sleep "$LOG_JANITOR_POLL_S"
+    for f in "$WORKING_DIR"/node*/node.log "$WORKING_DIR"/actor-feeder.log "$WORKING_DIR"/tx-centrifuge.log; do
+      [ -f "$f" ] || continue
+      kb="$(du -k "$f" 2>/dev/null | cut -f1)" || continue
+      if [ "${kb:-0}" -gt "$max_kb" ]; then
+        : >"$f"
+        echo "(log janitor: truncated ${f#"$WORKING_DIR"/} at $((kb / 1024)) MB)"
+      fi
+    done
+    free="$(df -g "$WORKING_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
+    if [ -n "$free" ] && [ "$free" -lt "$ABORT_FREE_GB" ]; then
+      echo "!!! Only ${free} GB left — stopping the demo before it fills the disk."
+      kill -INT $$ >/dev/null 2>&1 || true
+      return
+    fi
+  done
+}
+log_janitor &
+log_janitor_pid=$!
 
 eviction_controller &
 eviction_controller_pid=$!
