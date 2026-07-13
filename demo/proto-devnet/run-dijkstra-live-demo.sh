@@ -60,6 +60,10 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Poll often: a log overshoots its cap by (write rate x interval), and a chatty
 # trace level writes hundreds of MB per minute. du on one file is a stat.
 : "${LOG_JANITOR_POLL_S:=10}"
+# Every sender's fee refunds land on delegator1's staking account — registered
+# at genesis, so the ledger's fee split (base / premium / refund) actually
+# executes. Without it every bid would stay whole in the fee pot.
+: "${FEE_REFUND_STAKE_VKEY:=${SOURCE_DIR}/config/stake-delegators/delegator1/staking.vkey}"
 
 RUN_LOG="${WORKING_DIR}.live-demo.log"
 
@@ -110,6 +114,7 @@ evict_aggregator_pid=""
 eviction_controller_pid=""
 watchdog_pid=""
 log_janitor_pid=""
+incentives_pid=""
 http_public_pid=""
 
 compose_file="${WORKING_DIR}/process-compose.no-tx-centrifuge.yaml"
@@ -125,7 +130,7 @@ stop_everything() {
   trap - INT TERM EXIT
   echo ""
   echo "Stopping live demo (feeders, tailer, web server, devnet)..."
-  for pid in "$optimistic_feeder_pid" "$urgent_feeder_pid" "$actor_feeder_pid" "$aggregator_pid" "$conflict_feeder_pid" "$evict_aggregator_pid" "$eviction_controller_pid" "$watchdog_pid" "$log_janitor_pid" "$tailer_pid" "$http_pid" "${http_public_pid:-}"; do
+  for pid in "$optimistic_feeder_pid" "$urgent_feeder_pid" "$actor_feeder_pid" "$aggregator_pid" "$conflict_feeder_pid" "$evict_aggregator_pid" "$eviction_controller_pid" "$watchdog_pid" "$log_janitor_pid" "$incentives_pid" "$tailer_pid" "$http_pid" "${http_public_pid:-}"; do
     [ -n "$pid" ] && kill "$pid" >/dev/null 2>&1 || true
   done
   # The dashboard-controlled eviction generators run under the controller subshell;
@@ -167,6 +172,7 @@ rm -f "$RUN_LOG"
 : >"${DEMO_DIR}/removed-txs.ndjson"
 : >"${DEMO_DIR}/evicted-txs.ndjson"
 : >"${DEMO_DIR}/dropped-txs.ndjson"
+: >"${DEMO_DIR}/incentives.ndjson"
 rm -f "$QUOTES_FILE"
 rm -f "${DEMO_DIR}/leios-status.json"
 rm -f "${DEMO_DIR}/lifecycle.json"
@@ -241,6 +247,7 @@ sleep 1
 : >"${DEMO_DIR}/removed-txs.ndjson"
 : >"${DEMO_DIR}/evicted-txs.ndjson"
 : >"${DEMO_DIR}/dropped-txs.ndjson"
+: >"${DEMO_DIR}/incentives.ndjson"
 
 # Stream every node's forge traces into the dashboard's live feed. Each block is
 # forged by exactly one node, so merging the three logs gives the full sequence.
@@ -252,6 +259,15 @@ python3 "$SOURCE_DIR/live-trace-tailer.py" --evictions "$EVICT_STREAM" "$LIVE_ST
   "$WORKING_DIR/node2/node.log" \
   "$WORKING_DIR/node3/node.log" &
 tailer_pid=$!
+
+# Measured fee-split pots, one record per block: what the fee pot kept, the
+# premiums donated to the treasury, and the refunds pending/credited on the
+# refund account. Read from the node's own ledger state — not recomputed.
+python3 "$SOURCE_DIR/incentives-poller.py" \
+  "$DEMO_DIR/incentives.ndjson" "$LIVE_STREAM" "$FEE_REFUND_STAKE_VKEY" \
+  --socket "$socket" --network-magic "$NETWORK_MAGIC" \
+  >"$WORKING_DIR/incentives-poller.log" 2>&1 &
+incentives_pid=$!
 
 # Reset the dashboard-controlled eviction switch (the dashboard POSTs
 # {"mode":"off"|"type1"|"type2"} to /eviction-control; the controller loop below
@@ -281,6 +297,7 @@ run_feeder_forever() {
   "$LANE_FEEDER" \
     --socket "$socket" \
     --funds "$WORKING_DIR/funds.json" \
+    --fee-refund-stake-vkey "$FEE_REFUND_STAKE_VKEY" \
     --network-magic "$NETWORK_MAGIC" \
     --fee "$FEE" \
     --metadata-bytes "$METADATA_BYTES" \
@@ -300,6 +317,7 @@ if [ "$CONFLICT_MODE" = "1" ]; then
   "$LANE_FEEDER" \
     --socket "$socket" \
     --funds "$WORKING_DIR/funds.json" \
+    --fee-refund-stake-vkey "$FEE_REFUND_STAKE_VKEY" \
     --network-magic "$NETWORK_MAGIC" \
     --fee "$FEE" \
     --metadata-bytes "$METADATA_BYTES" \
@@ -320,6 +338,7 @@ elif [ "$INDEPENDENT_FUNDING" = "1" ]; then
   "$LANE_FEEDER" \
     --socket "$socket" \
     --funds "$WORKING_DIR/funds.json" \
+    --fee-refund-stake-vkey "$FEE_REFUND_STAKE_VKEY" \
     --network-magic "$NETWORK_MAGIC" \
     --fee "$FEE" \
     --metadata-bytes "$METADATA_BYTES" \
@@ -339,6 +358,7 @@ elif [ "$ACTOR_MODE" = "1" ]; then
     "$LANE_FEEDER" \
       --socket "$socket" \
       --funds "$WORKING_DIR/funds.json" \
+      --fee-refund-stake-vkey "$FEE_REFUND_STAKE_VKEY" \
       --network-magic "$NETWORK_MAGIC" \
       --fee "$FEE" \
       --metadata-bytes "$METADATA_BYTES" \
@@ -466,6 +486,7 @@ print(max(1500000, quote * size * 27 // 20))
           echo "type1 burst: bid ${t1_bid} lovelace (~1.35x the live urgent cost)"
           CURRENT_T1_BID="$t1_bid"
           "$LANE_FEEDER" --socket "$socket" --funds "$WORKING_DIR/funds.json" \
+            --fee-refund-stake-vkey "$FEE_REFUND_STAKE_VKEY" \
             --network-magic "$NETWORK_MAGIC" --fee "$t1_bid" \
             --metadata-bytes "$T1_METADATA" --cycles "$CYCLES" \
             --delay-ms "$T1_DELAY_MS" --independent-funding \
@@ -480,6 +501,7 @@ print(max(1500000, quote * size * 27 // 20))
           echo "$agg_pid" >"$WORKING_DIR/evgen-aggregator.pid"
         else
           "$LANE_FEEDER" --socket "$socket" --funds "$WORKING_DIR/funds.json" \
+            --fee-refund-stake-vkey "$FEE_REFUND_STAKE_VKEY" \
             --network-magic "$NETWORK_MAGIC" --fee "$T2_FEE" \
             --metadata-bytes "$T2_METADATA" --cycles "$CYCLES" \
             --delay-ms "$T2_DELAY_MS" --conflict-mode \
@@ -543,6 +565,14 @@ plumbing_watchdog() {
       python3 "$SOURCE_DIR/live-trace-tailer.py" --from-now --evictions "$EVICT_STREAM" "$LIVE_STREAM" \
         "$WORKING_DIR/node1/node.log" "$WORKING_DIR/node2/node.log" "$WORKING_DIR/node3/node.log" &
       tailer_pid=$!
+    fi
+    if [ -n "$incentives_pid" ] && ! kill -0 "$incentives_pid" >/dev/null 2>&1; then
+      echo "(incentives poller died — restarting)"
+      python3 "$SOURCE_DIR/incentives-poller.py" \
+        "$DEMO_DIR/incentives.ndjson" "$LIVE_STREAM" "$FEE_REFUND_STAKE_VKEY" \
+        --socket "$socket" --network-magic "$NETWORK_MAGIC" \
+        >>"$WORKING_DIR/incentives-poller.log" 2>&1 &
+      incentives_pid=$!
     fi
     if ! kill -0 "$http_pid" >/dev/null 2>&1; then
       echo "(demo server died — restarting)"
