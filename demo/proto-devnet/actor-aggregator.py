@@ -106,7 +106,7 @@ def main():
     open(dropped_path, "w").close()
 
     counts = {"urgent": 0, "optimistic": 0, "shed": 0}
-    last_qu, last_qo = 704, 44
+    last_qu, last_qo = 88, 44
     seen = 0
     bucket = 0
 

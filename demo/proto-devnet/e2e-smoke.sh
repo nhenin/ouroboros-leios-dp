@@ -75,7 +75,7 @@ def rows(path):
         return []
 live, inc = rows(live_path), rows(inc_path)
 blocks = bool(live) and live[-1].get("i", 0) >= want
-repriced = any(r.get("urgent") not in (None, 16 * 44) for r in live)
+repriced = any(r.get("urgent") not in (None, 2 * 44) for r in live)
 certified = any(r.get("certIn") for r in live)
 split = bool(inc) and inc[-1].get("donation", 0) > 0 and inc[-1].get("refundsDelivered", 0) > 0
 print(f"{'y' if blocks else 'n'}{'y' if repriced else 'n'}{'y' if certified else 'n'}{'y' if split else 'n'}",

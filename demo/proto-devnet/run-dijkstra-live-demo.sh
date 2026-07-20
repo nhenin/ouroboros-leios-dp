@@ -478,7 +478,7 @@ import json, sys
 try:
     quote = json.load(open('$QUOTES_FILE'))['urgent']
 except Exception:
-    quote = 704
+    quote = 88
 size = $T1_METADATA + 300
 print(max(1500000, quote * size * 27 // 20))
 ")
