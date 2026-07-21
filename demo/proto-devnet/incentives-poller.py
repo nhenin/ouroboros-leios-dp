@@ -25,7 +25,7 @@ for block) and hold for the pinned node/ledger versions of this prototype:
 
     fees      = nes[3][1][1][2]        (UTxOState.utxosFees)
     donation  = nes[3][1][1][5]        (UTxOState.utxosDonation)
-    pricing   = nes[3][1][1][6]        ([urgent, optimistic, usage, pendingRefunds])
+    pricing   = nes[3][1][1][6]        ([urgent, optimistic, usage, pendingRefunds, signalWindows])
     treasury  = nes[3][0][0]           (ChainAccountState)
     accounts  = nes[3][1][0][2][0]     (map [0, stakeKeyhash] -> [balance, ...])
 
