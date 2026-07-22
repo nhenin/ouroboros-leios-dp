@@ -142,20 +142,33 @@ def main():
     FLUSH_AFTER_S = 15.0
 
     # A superseded EB's riders are given back to the mempool (the node's
-    # readmission). The ones that re-enter get re-stripped under a later EB
-    # within seconds; whatever never reappears could not re-enter — the
-    # quote climbed past its max fee while its block was failing. That is a
-    # price verdict, not a system failure: stage "returned", not "stranded".
-    returned_pending = []   # [{"txids": set, "at": read-time}]
-    RETURN_GRACE_S = 30.0
+    # readmission). The ones that re-enter get re-stripped under a later EB;
+    # whatever never reappears could not re-enter — the quote climbed past
+    # its max fee while its block was failing. That is a price verdict, not
+    # a system failure: stage "returned", not "stranded". The clock starts
+    # only when the node's own LeiosMempoolReadmitted trace confirms the
+    # readmission ran (readmission happens at the NEXT body arrival, which
+    # can be minutes away — a wall clock from supersession races it), and a
+    # readmission that accepted nothing flushes the batch immediately. The
+    # long fallback only guards a lost trace (log rotation).
+    returned_pending = []   # [{"ebHash", "txids": set, "seen": t, "at": None|t}]
+    RETURN_GRACE_S = 120.0
+    RETURN_FALLBACK_S = 600.0
 
     def flush_returned():
         now = time.time()
-        while returned_pending and now - returned_pending[0]["at"] > RETURN_GRACE_S:
-            batch = returned_pending.pop(0)
+        keep = []
+        for batch in returned_pending:
+            started = batch["at"]
+            expired = (started is not None and now - started > RETURN_GRACE_S) \
+                or (started is None and now - batch["seen"] > RETURN_FALLBACK_S)
+            if not expired:
+                keep.append(batch)
+                continue
             if batch["txids"]:
                 emit_removed([{"txid": t, "stage": "returned", "lane": "?"}
                               for t in sorted(batch["txids"])])
+        returned_pending[:] = keep
 
     def expire_hand_flushes():
         flush_returned()
@@ -168,8 +181,8 @@ def main():
     def write_leios_status():
         # "Stalled" = uncertified AND newer than the last certified EB. An older
         # uncertified EB was superseded — since the announced-EB strip its txs
-        # are gone from every mempool (emitted as "stranded"), so counting them
-        # forever would inflate the number all run long.
+        # left every mempool and went through readmission (stages "riding" or
+        # "returned"), so counting them forever would inflate the number.
         last_cert_slot = max(
             (eb_forged[h]["slot"] for h in eb_certified if h in eb_forged), default=-1
         )
@@ -309,7 +322,8 @@ def main():
                 continue
             progressed = True
             if ("LeiosBlockForged" in line or "LeiosBlockCertified" in line
-                    or "LeiosMempoolStripped" in line):
+                    or "LeiosMempoolStripped" in line
+                    or "LeiosMempoolReadmitted" in line):
                 try:
                     inner = json.loads(json.loads(line)["message"])
                     data = inner.get("data", {})
@@ -361,26 +375,43 @@ def main():
                                          if v["slot"] is not None and v["slot"] < eb_slot]
                                 for k in stale:
                                     returned_pending.append(
-                                        {"txids": set(riders_by_eb.pop(k)["txids"]),
-                                         "at": time.time()})
+                                        {"ebHash": k,
+                                         "txids": set(riders_by_eb.pop(k)["txids"]),
+                                         "seen": time.time(), "at": None})
                         eb_certified.add(h)
                         write_leios_status()
                     elif kind == "LeiosMempoolStripped" and p == node1:
                         n = data.get("txCount")
-                        for i, batch in enumerate(strip_pending):
-                            if len(batch["txids"]) == n:
-                                strip_pending.pop(i)
-                                for rp in returned_pending:
-                                    rp["txids"] -= set(batch["txids"])
-                                h = data.get("ebHash", "")
-                                if h in eb_certified:
-                                    # certificate already landed (queue lag)
-                                    emit_removed([{"txid": t, "stage": "riding", "lane": "?"}
-                                                  for t in batch["txids"]])
-                                else:
-                                    r = riders_by_eb.setdefault(
-                                        h, {"slot": data.get("ebSlot"), "txids": []})
-                                    r["txids"] += batch["txids"]
+                        matches = [i for i, b in enumerate(strip_pending)
+                                   if len(b["txids"]) == n]
+                        if matches:
+                            # Prefer the most recent batch: an old equal-count
+                            # hand flush must not steal a fresh strip's claim.
+                            batch = strip_pending.pop(matches[-1])
+                            claimed = set(batch["txids"])
+                            for rp in returned_pending:
+                                rp["txids"] -= claimed
+                            # A tx rides at most one live EB: a re-strip
+                            # supersedes every older rider membership.
+                            strip_slot = data.get("ebSlot")
+                            for v in riders_by_eb.values():
+                                if strip_slot is None or (v["slot"] is not None and v["slot"] < strip_slot):
+                                    v["txids"] = [t for t in v["txids"] if t not in claimed]
+                            h = data.get("ebHash", "")
+                            if h in eb_certified:
+                                # certificate already landed (queue lag)
+                                emit_removed([{"txid": t, "stage": "riding", "lane": "?"}
+                                              for t in batch["txids"]])
+                            else:
+                                r = riders_by_eb.setdefault(
+                                    h, {"slot": data.get("ebSlot"), "txids": []})
+                                r["txids"] += batch["txids"]
+                    if kind == "LeiosMempoolReadmitted" and p == node1:
+                        h = data.get("ebHash", "")
+                        accepted = data.get("txCount") or 0
+                        for batch in returned_pending:
+                            if batch.get("ebHash") == h and batch["at"] is None:
+                                batch["at"] = 0 if accepted == 0 else time.time()
                                 break
                     continue
                 except Exception:
