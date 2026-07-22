@@ -19,12 +19,15 @@ label active when it was made (the feeder stamps gen=<label>). We join:
   - accepted lines   -> txid prefix -> generation AND lane (the feeder's own
     record — authoritative even when a removal line can't tell the lane)
   - removed-txs.ndjson (from live-trace-tailer) -> per-tx stage: "cleared" (the
-    tx landed on-chain; its mempool copy was housekept away), "evicted" (priced
-    out while waiting), "orphaned" (chained behind an evicted tx) or "flushed"
-    (dropped by hand via the presenter's flush command) — attributed back to
-    the generation via the txid prefix. Every drop kind is counted separately
-    and split per lane, so the journal can say WHY a tx never made it, not just
-    that it didn't.
+    tx landed on-chain; its mempool copy was housekept away), "riding" (stripped
+    for an announced endorser block whose certificate landed — settled on-chain
+    through the optimistic pipeline, counted forged), "evicted" (priced out
+    while waiting), "orphaned" (chained behind an evicted tx), "flushed"
+    (dropped by hand via the presenter's flush command) or "stranded" (stripped
+    for an endorser block that was superseded uncertified — a real drop) —
+    attributed back to the generation via the txid prefix. Every drop kind is
+    counted separately and split per lane, so the journal can say WHY a tx
+    never made it, not just that it didn't.
 and periodically snapshot lifecycle.json: per generation, how many txs were
 sent, accepted, are still waiting in the mempool, landed in a block, or were
 dropped (and how). That is what lets the dashboard show the latency between a
@@ -121,10 +124,14 @@ def main():
             generations[label] = {
                 "label": label, "sent": 0, "urgent": 0, "optimistic": 0, "shed": 0,
                 "accepted": 0, "forged": 0, "evicted": 0, "orphaned": 0, "flushed": 0,
+                "rode": 0, "stranded": 0, "returned": 0,
                 "acceptedUrgent": 0, "acceptedOptimistic": 0,
                 "evictedUrgent": 0, "evictedOptimistic": 0,
                 "orphanedUrgent": 0, "orphanedOptimistic": 0,
                 "flushedUrgent": 0, "flushedOptimistic": 0,
+                "rodeUrgent": 0, "rodeOptimistic": 0,
+                "strandedUrgent": 0, "strandedOptimistic": 0,
+                "returnedUrgent": 0, "returnedOptimistic": 0,
                 "doneUrgent": 0, "doneOptimistic": 0,
                 "firstSeen": time.time(), "lastSeen": time.time(),
             }
@@ -136,7 +143,8 @@ def main():
         gens = list(generations.values())[-15:]
         for g in gens:
             g["waiting"] = max(0, g["accepted"] - g["forged"] - g["evicted"]
-                               - g.get("orphaned", 0) - g.get("flushed", 0))
+                               - g.get("orphaned", 0) - g.get("flushed", 0)
+                               - g.get("stranded", 0) - g.get("returned", 0))
             g["waitingUrgent"] = max(0, g.get("acceptedUrgent", 0) - g.get("doneUrgent", 0))
             g["waitingOptimistic"] = max(0, g.get("acceptedOptimistic", 0) - g.get("doneOptimistic", 0))
         tmp = lifecycle_path + ".tmp"
@@ -232,10 +240,28 @@ def main():
                     # never a forge: selling it as "forged" broke the story
                     g["flushed"] += 1
                     g["flushed" + suffix] += 1
+                elif stage == "riding":
+                    # rode an endorser block to its certificate — settled
+                    # on-chain, a forge through the optimistic pipeline
+                    g["forged"] += 1
+                    g["rode"] += 1
+                    g["rode" + suffix] += 1
+                elif stage == "stranded":
+                    # stripped for an endorser block superseded uncertified —
+                    # gone from every mempool, never settled
+                    g["stranded"] += 1
+                    g["stranded" + suffix] += 1
+                elif stage == "returned":
+                    # its endorser block missed certification and the mempool
+                    # refused it on return: the quote had climbed past its max
+                    # fee while the block was failing — a price verdict, the
+                    # same one eviction would have delivered
+                    g["returned"] += 1
+                    g["returned" + suffix] += 1
                 else:
                     g["forged"] += 1
                 g["done" + suffix] += 1
-                if stage in ("evicted", "orphaned", "flushed"):
+                if stage in ("evicted", "orphaned", "flushed", "stranded", "returned"):
                     with open(dropped_path, "a") as out:
                         out.write(json.dumps({"txid": rec.get("txid"), "gen": label,
                                               "stage": stage, "lane": lane}) + "\n")

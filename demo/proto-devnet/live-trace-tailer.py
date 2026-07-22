@@ -129,11 +129,47 @@ def main():
     # forge-prices, so the block's record is held pending and stamped from here —
     # certification shows on the block that actually certified, not the next one.
     cert_by_slot = {}
+    # Strips vs hand flushes: the announced-EB mempool strip and the presenter's
+    # flush both remove through removeTxsEvenIfValid, so both trace
+    # ManuallyRemovedTxs. The strip traces its own LeiosMempoolStripped (ebHash
+    # + txCount) right after its removal — pair each removal batch with it by
+    # exact count (the kernel tracer's queue lags the mempool tracer's by
+    # seconds, so batches wait). A batch no strip trace claims within the
+    # window was a hand flush. Claimed txs are riders: held per EB and emitted
+    # as "riding" once its certificate lands — only then did they settle.
+    strip_pending = []   # [{"txids", "read"}] batches awaiting a strip trace
+    riders_by_eb = {}    # ebHash -> {"slot", "txids"} awaiting a certificate
+    FLUSH_AFTER_S = 15.0
+
+    # A superseded EB's riders are given back to the mempool (the node's
+    # readmission). The ones that re-enter get re-stripped under a later EB
+    # within seconds; whatever never reappears could not re-enter — the
+    # quote climbed past its max fee while its block was failing. That is a
+    # price verdict, not a system failure: stage "returned", not "stranded".
+    returned_pending = []   # [{"txids": set, "at": read-time}]
+    RETURN_GRACE_S = 30.0
+
+    def flush_returned():
+        now = time.time()
+        while returned_pending and now - returned_pending[0]["at"] > RETURN_GRACE_S:
+            batch = returned_pending.pop(0)
+            if batch["txids"]:
+                emit_removed([{"txid": t, "stage": "returned", "lane": "?"}
+                              for t in sorted(batch["txids"])])
+
+    def expire_hand_flushes():
+        flush_returned()
+        now = time.time()
+        while strip_pending and now - strip_pending[0]["read"] > FLUSH_AFTER_S:
+            batch = strip_pending.pop(0)
+            emit_removed([{"txid": t, "stage": "flushed", "lane": "?"}
+                          for t in batch["txids"]])
 
     def write_leios_status():
         # "Stalled" = uncertified AND newer than the last certified EB. An older
-        # uncertified EB was superseded (a later one certified; its txs rode
-        # again) — counting those forever would inflate the number all run long.
+        # uncertified EB was superseded — since the announced-EB strip its txs
+        # are gone from every mempool (emitted as "stranded"), so counting them
+        # forever would inflate the number all run long.
         last_cert_slot = max(
             (eb_forged[h]["slot"] for h in eb_certified if h in eb_forged), default=-1
         )
@@ -272,7 +308,8 @@ def main():
             if not line:
                 continue
             progressed = True
-            if "LeiosBlockForged" in line or "LeiosBlockCertified" in line:
+            if ("LeiosBlockForged" in line or "LeiosBlockCertified" in line
+                    or "LeiosMempoolStripped" in line):
                 try:
                     inner = json.loads(json.loads(line)["message"])
                     data = inner.get("data", {})
@@ -310,21 +347,55 @@ def main():
                                 if len(cert_by_slot) > 50:  # unmatched — don't leak
                                     for k in sorted(cert_by_slot)[:25]:
                                         del cert_by_slot[k]
+                            # The certificate settles the EB's riders on-chain.
+                            riders = riders_by_eb.pop(h, None)
+                            if riders:
+                                emit_removed([{"txid": t, "stage": "riding", "lane": "?"}
+                                              for t in riders["txids"]])
+                            # An older EB still holding riders was superseded:
+                            # its txs left every mempool for a block that never
+                            # got its certificate.
+                            eb_slot = eb_forged.get(h, {}).get("slot")
+                            if eb_slot is not None:
+                                stale = [k for k, v in riders_by_eb.items()
+                                         if v["slot"] is not None and v["slot"] < eb_slot]
+                                for k in stale:
+                                    returned_pending.append(
+                                        {"txids": set(riders_by_eb.pop(k)["txids"]),
+                                         "at": time.time()})
                         eb_certified.add(h)
                         write_leios_status()
+                    elif kind == "LeiosMempoolStripped" and p == node1:
+                        n = data.get("txCount")
+                        for i, batch in enumerate(strip_pending):
+                            if len(batch["txids"]) == n:
+                                strip_pending.pop(i)
+                                for rp in returned_pending:
+                                    rp["txids"] -= set(batch["txids"])
+                                h = data.get("ebHash", "")
+                                if h in eb_certified:
+                                    # certificate already landed (queue lag)
+                                    emit_removed([{"txid": t, "stage": "riding", "lane": "?"}
+                                                  for t in batch["txids"]])
+                                else:
+                                    r = riders_by_eb.setdefault(
+                                        h, {"slot": data.get("ebSlot"), "txids": []})
+                                    r["txids"] += batch["txids"]
+                                break
                     continue
                 except Exception:
                     pass
             if p == node1 and "ManuallyRemovedTxs" in line:
-                # The lane-flush control removes txs through the mempool API —
-                # without this, flushed txs stay "waiting" in the journals
-                # forever. Short txids only; stage "flushed".
+                # Both the announced-EB strip and the lane-flush control land
+                # here. Hold the batch: the strip's own trace claims it by
+                # count (-> riders of that EB); an unclaimed batch was a hand
+                # flush. Short txids only.
                 try:
                     inner = json.loads(json.loads(line)["message"])
                     data = inner.get("data") or {}
-                    txs = data.get("txsRemoved") or []
-                    emit_removed([{"txid": (t or "")[:8], "stage": "flushed", "lane": "?"}
-                                  for t in txs if t])
+                    txs = [(t or "")[:8] for t in (data.get("txsRemoved") or []) if t]
+                    if txs:
+                        strip_pending.append({"txids": txs, "read": time.time()})
                     size = data.get("mempoolSize") or {}
                     if size:
                         write_mempool_live(size, inner.get("at"))
@@ -552,6 +623,7 @@ def main():
                 # attach to THIS block instead of the next. Released by those
                 # traces, by the next round's forge-lanes, or on idle.
                 state[p]["pending"] = record
+        expire_hand_flushes()
         if not progressed:
             for p_ in log_paths:
                 flush_pending(p_)
