@@ -461,10 +461,12 @@ eviction_controller() {
         fi
         if [ "$want" = "type1" ]; then
           # Calibrate the burst bid from the LIVE urgent quote: high enough to
-          # be admitted now, low enough to be priced out fast — 1.35x today's
-          # cost is crossed on the second +25% step (1.25^2 = 1.56), so the
-          # burst's own full blocks price it out within ~2 blocks. A fixed
-          # bid only works for one price regime; this works in all of them.
+          # be admitted now, low enough to be priced out fast — 1.10x today's
+          # cost is crossed on the second +6.25% step (1.0625^2 = 1.129, the
+          # D=16 calibration), so the burst's own full blocks price it out
+          # within ~2 blocks — BEFORE the next endorser-block announcement
+          # can take the burst aboard as riders and rescue it. A fixed bid
+          # only works for one price regime; this works in all of them.
           t1_bid="$T1_BID"
           # A silent restart of the SAME scenario keeps its original bid: the
           # burst's own full blocks push the quote up, and recomputing 1.35x at
@@ -480,10 +482,10 @@ try:
 except Exception:
     quote = 88
 size = $T1_METADATA + 300
-print(max(1500000, quote * size * 27 // 20))
+print(max(1500000, quote * size * 11 // 10))
 ")
           fi
-          echo "type1 burst: bid ${t1_bid} lovelace (~1.35x the live urgent cost)"
+          echo "type1 burst: bid ${t1_bid} lovelace (~1.10x the live urgent cost)"
           CURRENT_T1_BID="$t1_bid"
           "$LANE_FEEDER" --socket "$socket" --funds "$WORKING_DIR/funds.json" \
             --fee-refund-stake-vkey "$FEE_REFUND_STAKE_VKEY" \
