@@ -27,11 +27,19 @@ label active when it was made (the feeder stamps gen=<label>). We join:
     for an endorser block that was superseded uncertified — a real drop) —
     attributed back to the generation via the txid prefix. Every drop kind is
     counted separately and split per lane, so the journal can say WHY a tx
-    never made it, not just that it didn't.
+    never made it, not just that it didn't. "returned" (and "flushed") are
+    PROVISIONAL verdicts: the tailer can still pair a lagging strip and settle
+    the tx as "riding". When that happens the drop is taken back — the counters
+    move to forged/rode and a correction line (the settlement record plus
+    "corrects": <old stage>) is appended to dropped-txs.ndjson so downstream
+    joins can undo the fossilized verdict too.
 and periodically snapshot lifecycle.json: per generation, how many txs were
 sent, accepted, are still waiting in the mempool, landed in a block, or were
 dropped (and how). That is what lets the dashboard show the latency between a
-cockpit command and its visible effect.
+cockpit command and its visible effect. An accepted line whose decision entry
+the overflow sweep already pruned is never credited to a generation (that
+would book an accepted without its sent); it lands in the snapshot's
+top-level "unattributedAccepted" counter instead.
 
 Usage: actor-aggregator.py <feeder.log> <out.ndjson> [bucket-size]
                            [--removed <removed-txs.ndjson>] [--lifecycle <lifecycle.json>]
@@ -117,6 +125,17 @@ def main():
     generations = {}
     pending_gen = {}   # decision n -> generation (until its accepted line shows up)
     tx_gen = {}        # txid 8-hex prefix -> (generation, lane)
+    # Provisional drop verdicts whose tx may yet settle: "returned" and
+    # "flushed" only say the tx left the MEMPOOL — an in-flight endorser
+    # block can still carry it to a certificate, and the tailer then pairs
+    # the lagging strip as "riding" AFTER the drop was booked. Popping
+    # tx_gen on the first record would fossilize the wrong story, so these
+    # verdicts leave a tombstone behind for the late settlement to recall.
+    tombstones = {}    # txid 8-hex prefix -> (generation, lane, stage)
+    # Accepted lines whose decision entry the overflow sweep already pruned.
+    # Kept OUT of every generation: crediting one would book an accepted
+    # without its sent — the one path to journal totals exceeding "sent".
+    unattributed = 0
     last_snapshot = 0.0
 
     def gen_bucket(label):
@@ -149,7 +168,8 @@ def main():
             g["waitingOptimistic"] = max(0, g.get("acceptedOptimistic", 0) - g.get("doneOptimistic", 0))
         tmp = lifecycle_path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"generations": gens, "updated": time.time()}, f)
+            json.dump({"generations": gens, "unattributedAccepted": unattributed,
+                       "updated": time.time()}, f)
         os.replace(tmp, lifecycle_path)
 
     handles = {}
@@ -174,7 +194,13 @@ def main():
                     g[lane] += 1
                 if lane in ("urgent", "optimistic"):
                     pending_gen[n] = label
-                    if len(pending_gen) > 10000:   # accepted line never came (chain drop)
+                    # Overflow sweep. Most swept entries are dead (the chain
+                    # dropped the submission, no accepted line will come), but
+                    # the feeder logs the decision BEFORE offering to its
+                    # bounded lane queue, so under backpressure a LIVE entry's
+                    # accepted line can trail by minutes and outlive the sweep
+                    # — such late accepts land in `unattributed` below.
+                    if len(pending_gen) > 10000:
                         for k in sorted(pending_gen)[:1000]:
                             del pending_gen[k]
                 if lane in counts:
@@ -199,7 +225,16 @@ def main():
             match = ACCEPTED_RE.match(line)
             if match:
                 n, lane, txid = int(match.group(1)), match.group(2), match.group(3)
-                label = pending_gen.pop(n, "warmup")
+                label = pending_gen.pop(n, None)
+                if label is None:
+                    # Its decision entry was pruned (see the overflow sweep):
+                    # this accept belongs to a generation we can no longer
+                    # name. Booking it into "warmup" — the old fallback — made
+                    # warmup show accepted > sent. Count it aside instead; its
+                    # txid is dropped too, so the removal join skips it like
+                    # any non-actor tx rather than minting a ghost generation.
+                    unattributed += 1
+                    continue
                 g = gen_bucket(label)
                 g["accepted"] += 1
                 if lane == "urgent":
@@ -217,9 +252,40 @@ def main():
                     rec = json.loads(line)
                 except ValueError:
                     continue
-                entry = tx_gen.pop(rec.get("txid", ""), None)
+                txid = rec.get("txid", "")
+                stage = rec.get("stage")
+                entry = tx_gen.pop(txid, None)
                 if entry is None:
-                    continue   # not an actor tx (scenario generators, other feeders)
+                    # A second record for a tx already judged. Only one
+                    # follow-up matters: a settlement landing on a tombstoned
+                    # provisional verdict — the endorser block made it after
+                    # all, its re-strip just lagged the grace window.
+                    tomb = tombstones.get(txid)
+                    if tomb is None or stage in (
+                            "evicted", "orphaned", "flushed", "stranded", "returned"):
+                        continue   # not an actor tx, or the drop verdict stands
+                    del tombstones[txid]
+                    label, lane, verdict = tomb
+                    suffix = "Urgent" if lane == "urgent" else "Optimistic"
+                    g = gen_bucket(label)
+                    # Take the drop back and credit the settlement. "done" was
+                    # already counted with the provisional verdict — the tx is
+                    # still done, just for the happy reason now — so the
+                    # waiting maths need no touch-up.
+                    g[verdict] -= 1
+                    g[verdict + suffix] -= 1
+                    g["forged"] += 1
+                    if stage == "riding":
+                        g["rode"] += 1
+                        g["rode" + suffix] += 1
+                    # The drop line is already in the journal stream: append a
+                    # correction (same shape + "corrects") so downstream joins
+                    # can undo the fossilized verdict instead of re-counting.
+                    with open(dropped_path, "a") as out:
+                        out.write(json.dumps({"txid": txid, "gen": label,
+                                              "stage": stage, "lane": lane,
+                                              "corrects": verdict}) + "\n")
+                    continue
                 label, lane = entry
                 # The feeder's own record of the lane is authoritative — a
                 # flushed-tx trace line only carries "?" for the lane.
@@ -227,7 +293,6 @@ def main():
                     lane = "urgent" if rec.get("lane") == "urgent" else "optimistic"
                 suffix = "Urgent" if lane == "urgent" else "Optimistic"
                 g = gen_bucket(label)
-                stage = rec.get("stage")
                 if stage == "evicted":
                     g["evicted"] += 1
                     g["evicted" + suffix] += 1
@@ -261,9 +326,14 @@ def main():
                 else:
                     g["forged"] += 1
                 g["done" + suffix] += 1
+                if stage in ("returned", "flushed"):
+                    tombstones[txid] = (label, lane, stage)
+                    if len(tombstones) > 50000:   # bounded like tx_gen
+                        for k in list(tombstones)[:10000]:
+                            del tombstones[k]
                 if stage in ("evicted", "orphaned", "flushed", "stranded", "returned"):
                     with open(dropped_path, "a") as out:
-                        out.write(json.dumps({"txid": rec.get("txid"), "gen": label,
+                        out.write(json.dumps({"txid": txid, "gen": label,
                                               "stage": stage, "lane": lane}) + "\n")
         now = time.time()
         if now - last_snapshot > 1.0:
