@@ -482,7 +482,11 @@ try:
 except Exception:
     quote = 88
 size = $T1_METADATA + 300
-print(max(1500000, quote * size * 11 // 10))
+# The FULL fee (fixed part + rate x size) times 1.10: at low quotes the
+# fixed 155,381 dominates, and a rate-only bid either misses admission or
+# needs the old 1.5A floor - whose headroom took 4 steps to cross, losing
+# the race against the next endorser block's rescue.
+print((155381 + quote * size) * 11 // 10)
 ")
           fi
           echo "type1 burst: bid ${t1_bid} lovelace (~1.10x the live urgent cost)"
