@@ -5,7 +5,7 @@ live dashboard.
 Every forged block emits a trio of traces (see NodeKernel.hs), in this order,
 all from the node that forged it:
 
-    forge lanes: RB urgent=<n>, EB optimistic=<m>
+    forge lanes: RB urgent=<n>, EB optimistic=<m>, ..., EB urgent=<r>
     forge queue: urgent=<qu>, optimistic=<qo>
     forge prices: urgent=<u>, optimistic=<o>
 
@@ -35,6 +35,7 @@ SPEND_INPUT_RE = re.compile(r'dtbrSpendInputs = fromList \[TxIn \(TxId \{unTxId 
 LANE_RE = re.compile(
     r"forge lanes:.*?RB[^0-9]*urgent=(\d+).*?EB[^0-9]*optimistic=(\d+)"
     r"(?:.*?rbBytes=(\d+))?(?:.*?ebBytes=(\d+))?(?:.*?ebHeld=(true|false))?"
+    r"(?:.*?EB urgent=(\d+))?"
 )
 QUEUE_RE = re.compile(
     r"forge queue:.*?urgent=(\d+).*?optimistic=(\d+)"
@@ -472,6 +473,8 @@ def main():
                 state[p]["rbBytes"] = int(lane.group(3)) if lane.group(3) else None
                 state[p]["ebBytes"] = int(lane.group(4)) if lane.group(4) else None
                 state[p]["ebHeld"] = lane.group(5) == "true" if lane.group(5) else None
+                # urgent riders merged into the EB (absent on pre-rider builds)
+                state[p]["ebUrgent"] = int(lane.group(6)) if lane.group(6) else None
                 continue
             queue = QUEUE_RE.search(line)
             if queue:
@@ -525,6 +528,8 @@ def main():
                     "rbBytes": state[p].get("rbBytes"),
                     "ebBytes": state[p].get("ebBytes"),
                     "ebHeld": state[p].get("ebHeld"),
+                    # urgent riders the EB carries (the lanes' FIFO merge)
+                    "ebUrgent": state[p].get("ebUrgent"),
                     # the certificate this block counts (stamped by slot when the
                     # LeiosBlockCertified trace lands; usually attached while this
                     # record is held pending, just below)
