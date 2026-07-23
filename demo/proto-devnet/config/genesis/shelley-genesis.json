@@ -3,7 +3,7 @@
   "networkId": "Testnet",
   "networkMagic": 164,
   "slotLength": 1,
-  "activeSlotsCoeff": 0.05,
+  "activeSlotsCoeff": 0.2,
   "securityParam": 2160,
   "epochLength": 432000,
   "slotsPerKESPeriod": 129600,
