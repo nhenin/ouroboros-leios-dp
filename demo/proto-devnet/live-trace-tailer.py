@@ -46,8 +46,8 @@ QUEUE_RE = re.compile(
 # Each lane's diffusion-time budget: mirrors the devnet config's
 # MempoolTimeoutCapacity (15 s) split by laneTimeoutCapacity (urgent 1/9 — a
 # short window, urgent traffic must not queue for hours — patient 8/9).
-MEMPOOL_TIME_BUDGET_S = 15.0
-URGENT_TIME_SHARE = 1.0 / 9.0
+MEMPOOL_TIME_BUDGET_S = 60.0
+URGENT_TIME_SHARE = 1.0 / 4.0
 PRICE_RE = re.compile(r"forge prices:.*?urgent=(\d+).*?optimistic=(\d+)")
 
 
