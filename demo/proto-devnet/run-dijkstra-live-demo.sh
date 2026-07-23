@@ -365,7 +365,7 @@ elif [ "$ACTOR_MODE" = "1" ]; then
       --cycles "$CYCLES" \
       --delay-ms "$DELAY_MS" \
       --actor-mode \
-      --fanout "${FANOUT:-32}" \
+      --fanout "${FANOUT:-96}" \
       --quotes-file "$QUOTES_FILE" \
       --actor-config "$ACTOR_CONFIG" \
       "$@" \
