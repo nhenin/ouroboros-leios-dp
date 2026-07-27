@@ -68,9 +68,26 @@ def main():
             if self.path.rstrip("/") == "/restart-network":
                 # Full restart: fresh chain, every component relaunched. The
                 # launcher survives this server's own death (new session).
+                # Delay the boot until the current supervisor's EXIT trap has
+                # released its ports and process-compose children; starting it
+                # immediately races that teardown and the old trap can stop the
+                # fresh devnet before its first Dijkstra block.
                 launcher = "/Users/nhenin/dev/ARC/stream-tiers-pricing/launch-demo.sh"
                 self._send_json(200, b'{"ok":true,"restarting":true}')
-                subprocess.Popen(["nohup", "bash", launcher],
+                restart_command = """
+                    i=0
+                    while [ "$i" -lt 30 ]; do
+                        if ! pgrep -f '[r]un-dijkstra-live-demo.sh' >/dev/null &&
+                           ! pgrep -f '[p]rocess-compose --no-server.*process-compose.no-tx-centrifuge.yaml' >/dev/null; then
+                            break
+                        fi
+                        i=$((i + 1))
+                        sleep 1
+                    done
+                    sleep 2
+                    exec bash "$1"
+                """
+                subprocess.Popen(["/bin/sh", "-c", restart_command, "restart-demo", launcher],
                                  stdout=open("/tmp/demo-restart.log", "w"),
                                  stderr=subprocess.STDOUT,
                                  start_new_session=True)

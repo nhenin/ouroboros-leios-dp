@@ -28,9 +28,13 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${WORKING_DIR:=${TMPDIR:-/tmp}/dijkstra-live-demo}"
 : "${LANE_FEEDER:=dijkstra-lane-feeder}"
 : "${NETWORK_MAGIC:=164}"
-: "${FEE:=10000000}"
+# Actor scenarios use this as their maximum fee ceiling. It must cover the
+# largest demo payload even after a sustained D=16 price climb; otherwise a
+# scenario labelled "ceiling bids" eventually evicts its own dependent chains.
+# The ledger still charges the live quote and refunds the unused headroom.
+: "${FEE:=25000000}"
 : "${METADATA_BYTES:=2000}"
-: "${DELAY_MS:=0}"
+: "${DELAY_MS:=200}"
 : "${CYCLES:=2000000}"
 : "${DEMO_DIR:=${SOURCE_DIR}/../../../../organisation/06_prototype/demo}"
 : "${HTTP_PORT:=8780}"
@@ -39,6 +43,10 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OPEN_BROWSER:=1}"
 : "${ACTOR_MODE:=1}"
 : "${ACTOR_BUCKET:=120}"
+# A 3 MB endorser block carries about 245 of the Standard storm's 12 KB txs.
+# Keep enough confirmed heads for the longest normal leadership/certificate gap:
+# at ~67 tx/s, 4096 heads are not reused for about a minute.
+: "${FANOUT:=4096}"
 # CONFLICT_MODE=1 replaces the load with the cross-lane conflict generator: each
 # cycle spends one input with both lanes, so the optimistic tx is evicted
 # (AllInputsAreSpent). An aggregator turns the feeder's submission results into the
@@ -54,7 +62,7 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The janitor truncates any log past MAX_LOG_MB in place; the tailer and the
 # aggregators already resume from a truncated file. ABORT_FREE_GB is the last
 # line of defence: below it the demo shuts itself down rather than the machine.
-: "${MAX_LOG_MB:=512}"
+: "${MAX_LOG_MB:=128}"
 : "${MIN_FREE_GB:=20}"
 : "${ABORT_FREE_GB:=5}"
 # Poll often: a log overshoots its cap by (write rate x interval), and a chatty
@@ -101,6 +109,7 @@ QUOTES_FILE="${DEMO_DIR}/latest-quotes.json"
 ACTOR_CONFIG="${DEMO_DIR}/actor-config.json"
 EVICTION_CONTROL="${DEMO_DIR}/eviction-control.json"
 RUN_CONFIG="${DEMO_DIR}/run-config.json"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 devnet_pid=""
 tailer_pid=""
@@ -178,7 +187,7 @@ rm -f "${DEMO_DIR}/leios-status.json"
 rm -f "${DEMO_DIR}/lifecycle.json"
 # Start from a default actor population (the dashboard rewrites this live).
 cat >"$ACTOR_CONFIG" <<'JSON'
-{"honest":60,"patient":20,"impatient":20,"valueMinAda":1,"valueMaxAda":30,"urgencyMin":0.02,"urgencyMax":0.35,"urgentLatency":1,"optimisticLatency":4,"reservationMultiple":1,"feeBuffer":1.2}
+{"honest":60,"patient":20,"impatient":20,"valueMinAda":1,"valueMaxAda":30,"urgencyMin":0.02,"urgencyMax":0.35,"urgentLatency":1,"optimisticLatency":4,"reservationMultiple":1,"feeBuffer":1.2,"delayMs":200,"laneMix":null,"label":"Calm day"}
 JSON
 
 # Demo control: the patched node withholds its Leios votes while this flag file
@@ -365,7 +374,7 @@ elif [ "$ACTOR_MODE" = "1" ]; then
       --cycles "$CYCLES" \
       --delay-ms "$DELAY_MS" \
       --actor-mode \
-      --fanout "${FANOUT:-96}" \
+      --fanout "$FANOUT" \
       --quotes-file "$QUOTES_FILE" \
       --actor-config "$ACTOR_CONFIG" \
       "$@" \
@@ -397,7 +406,7 @@ fi
 #          feeder log -> aggregator -> evictions.ndjson, stage "rejected").
 # Generators restart cleanly: before each start we ask the node for the fund's
 # current largest UTxO and hand it to the feeder (--initial-txin/--initial-value).
-: "${T1_BID:=auto}"   # auto = 1.8x the live urgent cost at scenario start
+: "${T1_BID:=auto}"   # auto = one worst-case controller step above the dominant live quote
 : "${T1_METADATA:=10000}"
 : "${T1_DELAY_MS:=50}"
 : "${T2_FEE:=10000000}"
@@ -409,8 +418,8 @@ write_run_config() {
   # What the dashboard's "what is running" explainer reads. t1Bid/t1TxBytes
   # describe the CURRENT squeeze burst (0 when none runs) so the dashboard can
   # say at which quote the burst txs get priced out.
-  printf '{"feed":"%s","feeLovelace":%s,"metadataBytes":%s,"delayMs":%s,"generator":"%s","t1Bid":%s,"t1TxBytes":%s}\n' \
-    "$FEED_MODE" "$FEE" "$METADATA_BYTES" "$DELAY_MS" "${1:-off}" "${CURRENT_T1_BID:-0}" "$((T1_METADATA + 300))" >"${RUN_CONFIG}.tmp"
+  printf '{"runId":"%s","feed":"%s","feeLovelace":%s,"metadataBytes":%s,"delayMs":%s,"generator":"%s","t1Bid":%s,"t1TxBytes":%s,"t1Lane":"%s"}\n' \
+    "$RUN_ID" "$FEED_MODE" "$FEE" "$METADATA_BYTES" "$DELAY_MS" "${1:-off}" "${CURRENT_T1_BID:-0}" "$((T1_METADATA + 300))" "${CURRENT_T1_LANE:-urgent}" >"${RUN_CONFIG}.tmp"
   mv "${RUN_CONFIG}.tmp" "$RUN_CONFIG"
 }
 
@@ -438,7 +447,8 @@ evgen_largest_utxo() {
 
 eviction_controller() {
   local current="off" pid="" agg_pid="" want line stall_count=0 gen_log gen_lines
-  local initial_args=()
+  local t1_bid t1_lane t1_quote
+  local initial_args=() t1_lane_args=()
   while :; do
     want=$(jq -r '.mode // "off"' "$EVICTION_CONTROL" 2>/dev/null || echo off)
     case "$want" in type1|type2|type3) ;; *) want="off" ;; esac
@@ -454,49 +464,61 @@ eviction_controller() {
         # keep being forged but never reach their certification quorum.
         touch "$WITHHOLD_FLAG"
       elif [ "$want" != "off" ]; then
-        sleep 15  # let in-flight generator txs land so the UTxO query is stable
+        # A first launch starts from an untouched genesis fund. Only a relaunch
+        # needs to wait for the previous generator's in-flight change output.
+        if [ "${RELAUNCH_SAME:-0}" = "1" ]; then sleep 15; fi
         initial_args=()
         if line=$(evgen_largest_utxo) && [ -n "$line" ]; then
           initial_args=(--initial-txin "${line%% *}" --initial-value "${line##* }")
         fi
         if [ "$want" = "type1" ]; then
-          # Calibrate the burst bid from the LIVE urgent quote: high enough to
-          # be admitted now, low enough to be priced out fast — 1.10x today's
-          # cost is crossed on the second +6.25% step (1.0625^2 = 1.129, the
-          # D=16 calibration), so the burst's own full blocks price it out
-          # within ~2 blocks — BEFORE the next endorser-block announcement
-          # can take the burst aboard as riders and rescue it. A fixed bid
-          # only works for one price regime; this works in all of them.
-          t1_bid="$T1_BID"
-          # A silent restart of the SAME scenario keeps its original bid: the
-          # burst's own full blocks push the quote up, and recomputing 1.35x at
-          # the climbed quote every relaunch would ratchet the bid upward and
-          # never let the crossing happen.
-          if [ "$t1_bid" = "auto" ] && [ "${CURRENT_T1_BID:-0}" != "0" ] && [ "${RELAUNCH_SAME:-0}" = "1" ]; then
-            t1_bid="$CURRENT_T1_BID"
-          elif [ "$t1_bid" = "auto" ]; then
-            t1_bid=$(python3 -c "
-import json, sys
+          # Drive whichever quote currently determines max-fee validity. The
+          # lanes may legitimately cross, so hard-coding urgent can make a burst
+          # miss admission after a standard storm. The bid covers exactly one
+          # worst-case D=16 update; the next adverse update prices out backlog.
+          read -r t1_bid t1_lane t1_quote <<EOF
+$(python3 -c "
+import json
 try:
-    quote = json.load(open('$QUOTES_FILE'))['urgent']
+    quotes = json.load(open('$QUOTES_FILE'))
+    urgent = int(quotes['urgent'])
+    standard = int(quotes['optimistic'])
 except Exception:
-    quote = 88
+    urgent, standard = 88, 44
+lane = 'urgent' if urgent >= standard else 'optimistic'
+quote = max(urgent, standard)
 size = $T1_METADATA + 300
-# The FULL fee (fixed part + rate x size) times 1.10: at low quotes the
-# fixed 155,381 dominates, and a rate-only bid either misses admission or
-# needs the old 1.5A floor - whose headroom took 4 steps to cross, losing
-# the race against the next endorser block's rescue.
-print((155381 + quote * size) * 11 // 10)
+configured = '$T1_BID'
+if configured == 'auto':
+    next_quote = (quote * 17 + 15) // 16
+    bid = 155381 + next_quote * size + 1
+else:
+    bid = int(configured)
+print(bid, lane, quote)
 ")
+EOF
+          # A silent restart of the SAME scenario keeps its original bid: the
+          # burst's own full blocks push the quote up, and recomputing at the
+          # climbed quote every relaunch would ratchet the bid upward and
+          # never let the crossing happen.
+          if [ "$T1_BID" = "auto" ] && [ "${CURRENT_T1_BID:-0}" != "0" ] && [ "${RELAUNCH_SAME:-0}" = "1" ]; then
+            t1_bid="$CURRENT_T1_BID"
+            t1_lane="${CURRENT_T1_LANE:-$t1_lane}"
           fi
-          echo "type1 burst: bid ${t1_bid} lovelace (~1.10x the live urgent cost)"
+          if [ "$t1_lane" = "optimistic" ]; then
+            t1_lane_args=(--optimistic-first 1 --urgent-after 0)
+          else
+            t1_lane_args=(--optimistic-first 0 --urgent-after 1)
+          fi
+          echo "type1 burst: ${t1_lane} lane, bid ${t1_bid} lovelace (one D=16 step above quote ${t1_quote})"
           CURRENT_T1_BID="$t1_bid"
+          CURRENT_T1_LANE="$t1_lane"
           "$LANE_FEEDER" --socket "$socket" --funds "$WORKING_DIR/funds.json" \
             --fee-refund-stake-vkey "$FEE_REFUND_STAKE_VKEY" \
             --network-magic "$NETWORK_MAGIC" --fee "$t1_bid" \
             --metadata-bytes "$T1_METADATA" --cycles "$CYCLES" \
             --delay-ms "$T1_DELAY_MS" --independent-funding \
-            --fund-index "$EVGEN_FUND_INDEX" "${initial_args[@]}" \
+            --fund-index "$EVGEN_FUND_INDEX" "${t1_lane_args[@]}" "${initial_args[@]}" \
             >"$WORKING_DIR/evgen-type1.log" 2>&1 &
           pid=$!
           # Door rejections (once the quote already tops the burst bid) only
@@ -523,6 +545,7 @@ print((155381 + quote * size) * 11 // 10)
       fi
       current="$want"
       [ "$current" = "type1" ] || CURRENT_T1_BID=0
+      [ "$current" = "type1" ] || CURRENT_T1_LANE=urgent
       RELAUNCH_SAME=0
       write_run_config "$current"
     elif [ "$current" = "type3" ]; then
@@ -605,17 +628,20 @@ watchdog_pid=$!
 
 # Keep the run's footprint bounded. Truncating in place (rather than removing)
 # frees the blocks immediately even though process-compose holds the file open,
-# and every reader here already recovers from a truncation.
+# and every reader here recovers from a truncation. The sidecar marker covers
+# the case where a hot log regrows past the reader's old offset before its next
+# size check.
 log_janitor() {
   local max_kb=$((MAX_LOG_MB * 1024))
   local f kb free
   while :; do
     sleep "$LOG_JANITOR_POLL_S"
-    for f in "$WORKING_DIR"/node*/node.log "$WORKING_DIR"/actor-feeder.log "$WORKING_DIR"/tx-centrifuge.log; do
+    for f in "$RUN_LOG" "$WORKING_DIR"/node*/node.log "$WORKING_DIR"/actor-feeder.log "$WORKING_DIR"/tx-centrifuge.log; do
       [ -f "$f" ] || continue
       kb="$(du -k "$f" 2>/dev/null | cut -f1)" || continue
       if [ "${kb:-0}" -gt "$max_kb" ]; then
         : >"$f"
+        touch "$f.truncated"
         echo "(log janitor: truncated ${f#"$WORKING_DIR"/} at $((kb / 1024)) MB)"
       fi
     done

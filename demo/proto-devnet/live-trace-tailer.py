@@ -9,17 +9,16 @@ all from the node that forged it:
     forge queue: urgent=<qu>, optimistic=<qo>
     forge prices: urgent=<u>, optimistic=<o>
 
-In a multi-node devnet each block is forged by exactly one node, so we follow
-every node log and merge their trios into a single block sequence, appending one
-JSON record per forged block to the output file (which the dashboard polls):
+In a multi-node devnet we follow every node log, merge each forger's trio with
+its TraceForgedBlock identity, and use node1's ChainDB selection events to keep
+only the canonical candidate after Praos tie-breaking. The output file polled by
+the dashboard therefore contains one JSON record per selected chain block:
 
     {"i": <i>, "urgent": <u>, "optimistic": <o>, "rb": <n>, "eb": <m>, "qu": <qu>, "qo": <qo>}
 
 where rb/eb are the txs forged into each lane's block and qu/qo are the txs still
-waiting in each lane (the queue depth) at forge time. We read one line per log
-per pass (round-robin), so emission order tracks real forge order, and each log
-keeps its own lanes/queue accumulator so interleaving across nodes never
-mis-pairs a trio.
+waiting in each lane (the queue depth) at forge time. Each log keeps its own
+lanes/queue accumulator so interleaving across nodes never mis-pairs a trio.
 
 Usage: live-trace-tailer.py <out.ndjson> <node.log> [<node.log> ...]
 """
@@ -87,13 +86,16 @@ def main():
     log_paths = args[1:]
 
     handles = {p: None for p in log_paths}
+    truncate_markers = {p: p + ".truncated" for p in log_paths}
+    truncate_seen = {}
+    for p, marker in truncate_markers.items():
+        try:
+            truncate_seen[p] = os.stat(marker).st_mtime_ns
+        except FileNotFoundError:
+            truncate_seen[p] = 0
     state = {p: {"rb": 0, "eb": 0, "qu": 0, "qo": 0} for p in log_paths}
     block_index = 0
-    # Praos slot battle: two nodes forge for the same slot and BOTH trace a
-    # forge — same prices, same fills, seconds apart. One chain block must be
-    # one dashboard block, so an identical fingerprint within the battle
-    # window is the same block seen twice, not a new one.
-    last_forge = {"fp": None, "ts": None}
+    last_emitted_block_no = -1
     if from_now:
         # Resuming mid-run: continue the block numbering where the stream
         # left off (NEXT index, the emit site post-increments), and never let
@@ -108,12 +110,23 @@ def main():
                     except ValueError:
                         continue  # torn/partial line - skip, keep scanning
                     block_index = max(block_index, rec.get("i", -1) + 1)
+                    last_emitted_block_no = max(
+                        last_emitted_block_no, rec.get("blockNo", -1)
+                    )
         except FileNotFoundError:
             pass
     ev_index = 0
     node1 = log_paths[0]  # count one node's mempool to avoid triple-counting
-    # NOTE: the stream files are truncated once by the run script at launch;
-    # the tailer only appends, so a late (re)start never wipes history.
+    # A forge trace is only a candidate. Node1's ChainDB tells us which hash
+    # actually became the tip after Praos tie-breaking. Hold that choice briefly
+    # because AddedToCurrentChain can be followed by SwitchedToAFork for the same
+    # block number less than a second later.
+    candidates_by_hash = {}
+    canonical_by_block_no = {}
+    CANONICAL_SETTLE_S = 2.5
+    # The run script bounds source logs in place. A sidecar marker makes a
+    # truncation observable even if the source regrows beyond our prior offset
+    # before this loop next checks its size.
 
     # The actor feeder reads the latest quotes from here, next to the stream.
     quotes_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), "latest-quotes.json")
@@ -129,6 +142,29 @@ def main():
     # forge-prices, so the block's record is held pending and stamped from here —
     # certification shows on the block that actually certified, not the next one.
     cert_by_slot = {}
+
+    def certificate_info(eb_hash):
+        forged = eb_forged.get(eb_hash, {})
+        return {
+            "hash": eb_hash[:8],
+            "numTxs": forged.get("numTxs", 0),
+            "optimistic": forged.get("optimistic", 0),
+            "urgent": forged.get("urgent", 0),
+            "bytes": forged.get("bytes", 0),
+        }
+
+    def apply_certificate(record, info):
+        """Project the applied block, not the pre-forge mempool selection."""
+        record["certIn"] = info
+        # The current prototype selects the certifying RB against the pre-cargo
+        # state, so Forge deliberately leaves its own payload empty. The price
+        # sample and delivered mass come from the previously announced EB.
+        record["rb"] = 0
+        record["rbBytes"] = 0
+        record["eb"] = info.get("optimistic", 0)
+        record["ebUrgent"] = info.get("urgent", 0)
+        record["ebBytes"] = info.get("bytes", 0)
+        record["ebHash"] = info.get("hash")
     # Strips vs hand flushes: the announced-EB mempool strip and the presenter's
     # flush both remove through removeTxsEvenIfValid, so both trace
     # ManuallyRemovedTxs. The strip traces its own LeiosMempoolStripped (ebHash
@@ -210,13 +246,69 @@ def main():
             json.dump(status, f)
         os.replace(tmp, leios_status_path)
 
-    def flush_pending(p_):
+    def discard_incomplete_pending(p_):
+        # A complete forge always receives TraceForgedBlock immediately after
+        # forge-prices. If another round starts first, this partial record has no
+        # consensus identity and must not become dashboard history.
+        state[p_].pop("pending", None)
+
+    def stage_candidate(p_, data):
         pending = state[p_].pop("pending", None)
-        if pending is not None:
-            # A certificate for this block may have landed while it waited.
-            if pending.get("certIn") is None:
-                pending["certIn"] = cert_by_slot.pop(pending.get("slot"), None)
-            emit(pending)
+        block_hash = data.get("block")
+        if pending is None or not block_hash:
+            return
+        pending["slot"] = data.get("slot", pending.get("slot"))
+        pending["blockNo"] = data.get("blockNo")
+        pending["blockHash"] = block_hash
+        pending["blockPrev"] = data.get("blockPrev")
+        candidates_by_hash[block_hash] = pending
+
+    def select_canonical(data):
+        view = data.get("newSuffixSelectView") or {}
+        block_no = view.get("blockNo")
+        new_tip = data.get("newtip") or ""
+        block_hash = new_tip.split("@", 1)[0]
+        if block_no is None or not block_hash:
+            return
+        canonical_by_block_no[int(block_no)] = {
+            "hash": block_hash,
+            "changed": time.time(),
+        }
+
+    def flush_canonical():
+        nonlocal block_index, last_emitted_block_no
+        now = time.time()
+        while True:
+            # Never overtake a selected block whose forger trace has not reached
+            # us yet. The node logs are consumed independently, so node1 can
+            # select block N before the forging node's candidate for N has been
+            # staged here. Emitting N+1 in that interval would create a fake
+            # multi-step price jump in History.
+            block_no = last_emitted_block_no + 1
+            selection = canonical_by_block_no.get(block_no)
+            if selection is None:
+                return
+            if now - selection["changed"] < CANONICAL_SETTLE_S:
+                return
+            record = candidates_by_hash.get(selection["hash"])
+            if record is None:
+                return
+            info = record.get("certIn")
+            if info is None:
+                info = cert_by_slot.pop(record.get("slot"), None)
+            if info is not None:
+                apply_certificate(record, info)
+            record["i"] = block_index
+            emit(record)
+            block_index += 1
+            last_emitted_block_no = block_no
+            for h, candidate in list(candidates_by_hash.items()):
+                candidate_no = candidate.get("blockNo")
+                if candidate_no is not None and candidate_no <= block_no:
+                    del candidates_by_hash[h]
+            for old_no in list(canonical_by_block_no):
+                if old_no <= block_no:
+                    del canonical_by_block_no[old_no]
 
     def emit_eviction(record):
         with open(evictions_path, "a") as out:
@@ -295,11 +387,14 @@ def main():
         with open(out_path, "a") as out:
             out.write(json.dumps(record) + "\n")
             out.flush()
-        # Publish the latest quotes atomically (write + rename) so a concurrent
-        # reader never sees a half-written file.
+
+    def publish_quotes(urgent, optimistic):
+        # Quote publication is intentionally independent from canonical-history
+        # settlement: the actor feeder must react to every current ledger quote,
+        # not wait for the dashboard's fork filter.
         tmp = quotes_path + ".tmp"
         with open(tmp, "w") as q:
-            json.dump({"urgent": record["urgent"], "optimistic": record["optimistic"]}, q)
+            json.dump({"urgent": urgent, "optimistic": optimistic}, q)
         os.replace(tmp, quotes_path)
 
     while True:
@@ -313,12 +408,31 @@ def main():
                         handle.seek(0, 2)
                 except FileNotFoundError:
                     continue
-            # Survive log rotation/truncation.
-            if os.path.exists(p) and os.stat(p).st_size < handle.tell():
+            marker_changed = False
+            try:
+                marker_mtime = os.stat(truncate_markers[p]).st_mtime_ns
+                marker_changed = marker_mtime > truncate_seen[p]
+            except FileNotFoundError:
+                marker_mtime = truncate_seen[p]
+            # Survive both slow and fast in-place truncation. The size check
+            # catches manual truncation; the marker catches truncate-and-regrow.
+            if marker_changed or (
+                os.path.exists(p) and os.stat(p).st_size < handle.tell()
+            ):
                 handle.close()
                 handle = handles[p] = open(p, "r")
+                truncate_seen[p] = marker_mtime
+            line_start = handle.tell()
             line = handle.readline()
             if not line:
+                continue
+            # These are regular files that process-compose is still appending to.
+            # readline() may therefore return the current, unterminated tail of a
+            # JSON record. Keep the offset before it and retry once the writer has
+            # completed the line; consuming the fragment can otherwise lose the
+            # only TraceForgedBlock for a height and stall canonical publication.
+            if not line.endswith("\n"):
+                handle.seek(line_start)
                 continue
             progressed = True
             if ("LeiosBlockForged" in line or "LeiosBlockCertified" in line
@@ -331,13 +445,17 @@ def main():
                     if kind == "LeiosBlockForged":
                         eb_forged.setdefault(
                             data.get("hash", ""),
-                            {"slot": data.get("slot", 0), "numTxs": data.get("numTxs", 0)},
+                            {
+                                "slot": data.get("slot", 0),
+                                "numTxs": data.get("numTxs", 0),
+                                "optimistic": state[p].get("eb", 0),
+                                "urgent": state[p].get("ebUrgent", 0),
+                                "bytes": state[p].get("ebBytes", 0),
+                            },
                         )
                         pending = state[p].get("pending")
                         if pending is not None:
                             pending["ebHash"] = data.get("hash", "")[:8]
-                            emit(pending)
-                            state[p]["pending"] = None
                         else:
                             state[p]["ebHash"] = data.get("hash", "")[:8]
                         write_leios_status()
@@ -345,17 +463,14 @@ def main():
                         h = data.get("ebHash", "")
                         at_slot = data.get("atSlot")
                         if h and h not in eb_certified:
-                            info = {"hash": h[:8],
-                                    "numTxs": eb_forged.get(h, {}).get("numTxs", 0)}
+                            info = certificate_info(h)
                             # This certifying block's record is held pending on
                             # this node (its forge-prices came a beat earlier) —
                             # stamp and release it now, so certification lands on
                             # the very block that certified.
                             pending = state[p].get("pending")
                             if pending is not None and pending.get("slot") == at_slot:
-                                pending["certIn"] = info
-                                emit(pending)
-                                state[p]["pending"] = None
+                                apply_certificate(pending, info)
                             else:
                                 cert_by_slot[at_slot] = info
                                 if len(cert_by_slot) > 50:  # unmatched — don't leak
@@ -416,6 +531,30 @@ def main():
                     continue
                 except Exception:
                     pass
+            if "TraceForgedBlock" in line:
+                try:
+                    inner = json.loads(json.loads(line)["message"])
+                    data = inner.get("data") or {}
+                    if data.get("kind") == "TraceForgedBlock":
+                        stage_candidate(p, data)
+                except Exception:
+                    pass
+                continue
+            if p == node1 and (
+                "ChainDB.AddBlockEvent.AddedToCurrentChain" in line
+                or "ChainDB.AddBlockEvent.SwitchedToAFork" in line
+            ):
+                try:
+                    inner = json.loads(json.loads(line)["message"])
+                    data = inner.get("data") or {}
+                    if data.get("kind") in (
+                        "AddedToCurrentChain",
+                        "TraceAddBlockEvent.SwitchedToAFork",
+                    ):
+                        select_canonical(data)
+                except Exception:
+                    pass
+                continue
             if p == node1 and "ManuallyRemovedTxs" in line:
                 # Both the announced-EB strip and the lane-flush control land
                 # here. Hold the batch: the strip's own trace claims it by
@@ -570,7 +709,7 @@ def main():
                 continue
             lane = LANE_RE.search(line)
             if lane:
-                flush_pending(p)   # a new round starts: whatever was pending is final
+                discard_incomplete_pending(p)
                 state[p]["rb"], state[p]["eb"] = int(lane.group(1)), int(lane.group(2))
                 state[p]["rbBytes"] = int(lane.group(3)) if lane.group(3) else None
                 state[p]["ebBytes"] = int(lane.group(4)) if lane.group(4) else None
@@ -602,26 +741,16 @@ def main():
                 continue
             price = PRICE_RE.search(line)
             if price:
-                fp = (price.group(1), price.group(2), state[p]["rb"], state[p]["eb"],
-                      state[p].get("rbBytes"), state[p].get("ebBytes"))
-                # the trace's "at" lives INSIDE the escaped message payload —
-                # a raw regex on the outer line never matches (verified live)
-                try:
-                    ts = parse_iso(json.loads(json.loads(line)["message"])["at"]).timestamp()
-                except Exception:
-                    ts = None
-                if (fp == last_forge["fp"] and ts is not None and last_forge["ts"] is not None
-                        and abs(ts - last_forge["ts"]) < 1.5):
-                    continue  # the same slot's battle twin — skip it
-                last_forge["fp"], last_forge["ts"] = fp, ts
+                urgent = int(price.group(1))
+                optimistic = int(price.group(2))
+                publish_quotes(urgent, optimistic)
                 record = {
-                    "i": block_index,
                     # the slot this block was forged in (from NodeIsLeader); the
                     # dashboard differences consecutive slots for the gap between
                     # blocks — what the 10-slot certification gap is measured on
                     "slot": state[p].get("leaderSlot"),
-                    "urgent": int(price.group(1)),
-                    "optimistic": int(price.group(2)),
+                    "urgent": urgent,
+                    "optimistic": optimistic,
                     "rb": state[p]["rb"],
                     "eb": state[p]["eb"],
                     # bytes each lane occupies — the block's TRUE fullness
@@ -647,17 +776,15 @@ def main():
                     # which node forged this block (the log that produced the trio)
                     "node": os.path.basename(os.path.dirname(p)),
                 }
-                block_index += 1
-                # Hold every record a beat before emitting: both its EB hash
-                # (LeiosBlockForged) and its certificate (LeiosBlockCertified)
-                # trace JUST AFTER this forge-prices line, so holding lets them
-                # attach to THIS block instead of the next. Released by those
-                # traces, by the next round's forge-lanes, or on idle.
+                if record["certIn"] is not None:
+                    apply_certificate(record, record["certIn"])
+                # TraceForgedBlock follows with the candidate's hash, parent and
+                # block number. ChainDB then decides whether that candidate is the
+                # canonical tip; only that selected hash is emitted.
                 state[p]["pending"] = record
         expire_hand_flushes()
+        flush_canonical()
         if not progressed:
-            for p_ in log_paths:
-                flush_pending(p_)
             time.sleep(0.25)
 
 

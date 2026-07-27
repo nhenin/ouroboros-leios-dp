@@ -67,15 +67,28 @@ def tail_lines(path, state):
     line caught mid-write is buffered until its newline arrives, so a decision
     cut before its gen= field is never mis-booked into the wrong generation."""
     handle = state.get(path)
+    marker = path + ".truncated"
     if handle is None:
         try:
             handle = state[path] = open(path, "r")
+            try:
+                state[path + "#truncate_mtime"] = os.stat(marker).st_mtime_ns
+            except FileNotFoundError:
+                state[path + "#truncate_mtime"] = 0
         except FileNotFoundError:
             return
-    if os.path.exists(path) and os.stat(path).st_size < handle.tell():
+    seen = state.get(path + "#truncate_mtime", 0)
+    try:
+        marker_mtime = os.stat(marker).st_mtime_ns
+    except FileNotFoundError:
+        marker_mtime = seen
+    if marker_mtime > seen or (
+        os.path.exists(path) and os.stat(path).st_size < handle.tell()
+    ):
         handle.close()
         handle = state[path] = open(path, "r")
         state[path + "#buf"] = ""
+        state[path + "#truncate_mtime"] = marker_mtime
     buf = state.get(path + "#buf", "")
     while True:
         chunk = handle.readline()

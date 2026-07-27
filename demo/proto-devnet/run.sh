@@ -134,6 +134,16 @@ for i in "${nodes[@]}"; do
     yq ".TraceOptionNodeName = \"$NODE_NAME\"" |
     yq ".TraceOptions[\"\"].backends[1] = \"PrometheusSimple 0.0.0.0 $((12900 + i))\"" \
       >"$NODE_DIR/config.yaml"
+  if [ "$i" -ne 1 ]; then
+    # The dashboard observes admission and revalidation on node1. Detailed
+    # mempool removal traces embed complete transactions; duplicating them on
+    # both peers can generate hundreds of MB per minute and make the canonical
+    # history projection fall behind the live chain during saturation tests.
+    yq -i '
+      .TraceOptions."Mempool.AddedTx".severity = "Silence" |
+      .TraceOptions."Mempool.RemoveTxs".severity = "Silence"
+    ' "$NODE_DIR/config.yaml"
+  fi
 
   # Generate upstream endpoints to other nodes
   accessPoints=$(for j in "${nodes[@]}"; do

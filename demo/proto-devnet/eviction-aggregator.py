@@ -20,9 +20,15 @@ Usage: eviction-aggregator.py <feeder.log> <out.ndjson>
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
+
+RESULT_RE = re.compile(r'^\d+:\s+(urgent|optimistic)\s+"([0-9a-f]{64})"')
+BID_MISMATCH_RE = re.compile(
+    r"BidBelowQuote.*?supplied:\s*Coin\s+(\d+),\s*expected:\s*Coin\s+(\d+)"
+)
 
 
 def classify(line):
@@ -67,6 +73,9 @@ def main():
         if "(conflicting) ->" not in line and not ("rejected" in line and "BidBelowQuote" in line):
             continue
         bid, spent, other = classify(line)
+        result = RESULT_RE.search(line)
+        mismatch = BID_MISMATCH_RE.search(line)
+        lane = result.group(1) if result else None
         # The feeder logs which lane the losing tx bought ("N: urgent ..." /
         # "N: optimistic ..."), so the dashboard can say what kind of tx lost.
         record = {
@@ -74,13 +83,24 @@ def main():
             "t": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "stage": "rejected",
             "n": 1,
-            "urgent": 1 if ": urgent " in line else 0,
-            "optimistic": 1 if ": optimistic " in line else 0,
+            "urgent": 1 if lane == "urgent" else 0,
+            "optimistic": 1 if lane == "optimistic" else 0,
             "bidBelowQuote": bid,
             "allInputsAreSpent": spent,
             "other": other,
             "mempoolTxs": None,
         }
+        if result:
+            record.update({"txid": result.group(2)[:12], "lane": lane})
+        if mismatch:
+            record.update(
+                {
+                    "bid": int(mismatch.group(1)),
+                    "required": int(mismatch.group(2)),
+                    "waitedS": 0,
+                    "burst": True,
+                }
+            )
         with open(out_path, "a") as out:
             out.write(json.dumps(record) + "\n")
             out.flush()

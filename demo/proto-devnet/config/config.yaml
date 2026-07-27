@@ -5,9 +5,9 @@ AlonzoGenesisFile: alonzo-genesis.json
 ConwayGenesisFile: conway-genesis.json
 DijkstraGenesisFile: dijkstra-genesis.json
 
-# Sizes the PATIENT pool (~200 MB, matching the urgent pool): deep enough
-# that a storm queues and reprices instead of bouncing at the door.
-MempoolCapacityBytesOverride: 200000000
+# The override sizes the PATIENT lane. Ten 3 MB endorser-block budgets give it
+# the same ~30 MB admission space as the independently-sized urgent lane.
+MempoolCapacityBytesOverride: 30000000
 # Mempool diffusion timeouts: the node wants the trio all-set or all-unset.
 # Soft/hard keep their defaults; the CAPACITY is the demo knob — the lanes
 # split it 1/4 urgent / 3/4 patient (Lanes.laneTimeoutCapacity).
@@ -115,13 +115,18 @@ TraceOptions:
   LedgerMetrics:
     severity: Info
   Mempool:
-    severity: Debug
+    severity: Notice
+  Mempool.AddedTx:
+    # node1's live projection consumes the compact txid + aggregate-size trace.
+    severity: Info
   Mempool.RemoveTxs:
     severity: Info
     detail: DDetailed
   Mempool.RejectedTx:
-    severity: Info
-    detail: DDetailed
+    # The feeder receives the submission result directly. Emitting the complete
+    # transaction here turns expected parent-wait retries into ~80 KB log lines
+    # and can outrun the live trace reader during saturation scenarios.
+    severity: Silence
   Mempool.AttemptAdd:
     severity: Silence
   Mempool.LedgerFound:
@@ -132,6 +137,10 @@ TraceOptions:
     severity: Silence
   Mempool.Synced:
     severity: Silence
+  TxSubmission:
+    # Per-peer flow-control chatter is emitted several times for every tx under
+    # load and is not consumed by any demo projection.
+    severity: Notice
   Net:
     severity: Notice
   Net.AcceptPolicy:
@@ -216,7 +225,7 @@ TraceOptions:
   TxSubmission.Remote:
     severity: Notice
   TxSubmission.TxInbound:
-    severity: Debug
+    severity: Notice
   TxSubmission.TxOutbound:
     severity: Notice
   Version.NodeVersion:
