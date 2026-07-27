@@ -65,6 +65,20 @@ def parse_iso(ts):
     return datetime.fromisoformat(ts)
 
 
+def eb_point(slot, eb_hash):
+    """Return the Linear Leios identity of an endorser block."""
+    if slot is None or not eb_hash:
+        return None
+    return (int(slot), eb_hash)
+
+
+def eb_point_id(point):
+    if point is None:
+        return None
+    slot, eb_hash = point
+    return f"{slot}:{eb_hash[:8]}"
+
+
 def main():
     args = sys.argv[1:]
     # Optional: also capture real re-validation evictions (Mempool.RemoveTxs) into a
@@ -135,18 +149,20 @@ def main():
     # certifies is the "awaiting votes" backlog the dashboard shows during the
     # certification-miss scenario.
     leios_status_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), "leios-status.json")
-    eb_forged = {}     # ebHash -> {"slot", "numTxs"}
+    eb_forged = {}     # (ebSlot, ebHash) -> {"slot", "numTxs", ...}
     eb_certified = set()
-    # Certificate landings keyed by the certifying block's slot (atSlot from the
-    # trace). The LeiosBlockCertified trace fires a beat AFTER that block's own
-    # forge-prices, so the block's record is held pending and stamped from here —
-    # certification shows on the block that actually certified, not the next one.
+    # Certificate landings keyed by source log and the certifying block's slot.
+    # Competing candidates at one slot can observe the same certificate, so a
+    # slot-only cache can stamp the wrong candidate after Praos tie-breaking.
     cert_by_slot = {}
 
-    def certificate_info(eb_hash):
-        forged = eb_forged.get(eb_hash, {})
+    def certificate_info(point):
+        forged = eb_forged.get(point, {})
+        slot, eb_hash = point
         return {
             "hash": eb_hash[:8],
+            "slot": slot,
+            "point": eb_point_id(point),
             "numTxs": forged.get("numTxs", 0),
             "optimistic": forged.get("optimistic", 0),
             "urgent": forged.get("urgent", 0),
@@ -165,6 +181,8 @@ def main():
         record["ebUrgent"] = info.get("urgent", 0)
         record["ebBytes"] = info.get("bytes", 0)
         record["ebHash"] = info.get("hash")
+        record["ebSlot"] = info.get("slot")
+        record["ebPoint"] = info.get("point")
     # Strips vs hand flushes: the announced-EB mempool strip and the presenter's
     # flush both remove through removeTxsEvenIfValid, so both trace
     # ManuallyRemovedTxs. The strip traces its own LeiosMempoolStripped (ebHash
@@ -174,7 +192,7 @@ def main():
     # window was a hand flush. Claimed txs are riders: held per EB and emitted
     # as "riding" once its certificate lands — only then did they settle.
     strip_pending = []   # [{"txids", "read"}] batches awaiting a strip trace
-    riders_by_eb = {}    # ebHash -> {"slot", "txids"} awaiting a certificate
+    riders_by_eb = {}    # (ebSlot, ebHash) -> {"slot", "txids"} awaiting a certificate
     FLUSH_AFTER_S = 15.0
 
     # A superseded EB's riders are given back to the mempool (the node's
@@ -187,7 +205,7 @@ def main():
     # can be minutes away — a wall clock from supersession races it), and a
     # readmission that accepted nothing flushes the batch immediately. The
     # long fallback only guards a lost trace (log rotation).
-    returned_pending = []   # [{"ebHash", "txids": set, "seen": t, "at": None|t}]
+    returned_pending = []   # [{"ebPoint", "txids": set, "seen": t, "at": None|t}]
     RETURN_GRACE_S = 120.0
     RETURN_FALLBACK_S = 600.0
 
@@ -220,25 +238,33 @@ def main():
         # left every mempool and went through readmission (stages "riding" or
         # "returned"), so counting them forever would inflate the number.
         last_cert_slot = max(
-            (eb_forged[h]["slot"] for h in eb_certified if h in eb_forged), default=-1
+            (eb_forged[point]["slot"] for point in eb_certified if point in eb_forged),
+            default=-1,
         )
         pending = [
-            h for h in eb_forged
-            if h not in eb_certified and eb_forged[h]["slot"] > last_cert_slot
+            point for point in eb_forged
+            if point not in eb_certified and eb_forged[point]["slot"] > last_cert_slot
         ]
         recent = sorted(eb_forged.items(), key=lambda kv: kv[1]["slot"])[-120:]
         status = {
             "forged": len(eb_forged),
             "certified": len(eb_certified),
             "pendingEbs": len(pending),
-            "pendingTxs": sum(eb_forged[h].get("numTxs", 0) for h in pending),
-            "lastForgedSlot": max((eb_forged[h]["slot"] for h in eb_forged), default=None),
+            "pendingTxs": sum(eb_forged[point].get("numTxs", 0) for point in pending),
+            "lastForgedSlot": max(
+                (eb_forged[point]["slot"] for point in eb_forged), default=None
+            ),
             # Per-EB status, newest last — the dashboard joins this against each
-            # block record's ebHash to colour blocks by certification state.
+            # block record's point to colour blocks by certification state.
             "ebs": [
-                {"hash": h[:8], "slot": v["slot"], "numTxs": v.get("numTxs", 0),
-                 "certified": h in eb_certified}
-                for h, v in recent
+                {
+                    "hash": point[1][:8],
+                    "slot": v["slot"],
+                    "numTxs": v.get("numTxs", 0),
+                    "point": eb_point_id(point),
+                    "certified": point in eb_certified,
+                }
+                for point, v in recent
             ],
         }
         tmp = leios_status_path + ".tmp"
@@ -295,9 +321,12 @@ def main():
                 return
             info = record.get("certIn")
             if info is None:
-                info = cert_by_slot.pop(record.get("slot"), None)
+                info = cert_by_slot.pop(
+                    (record.get("_traceSource"), record.get("slot")), None
+                )
             if info is not None:
                 apply_certificate(record, info)
+            record.pop("_traceSource", None)
             record["i"] = block_index
             emit(record)
             block_index += 1
@@ -443,8 +472,11 @@ def main():
                     data = inner.get("data", {})
                     kind = data.get("kind", "")
                     if kind == "LeiosBlockForged":
+                        point = eb_point(data.get("slot"), data.get("hash", ""))
+                        if point is None:
+                            continue
                         eb_forged.setdefault(
-                            data.get("hash", ""),
+                            point,
                             {
                                 "slot": data.get("slot", 0),
                                 "numTxs": data.get("numTxs", 0),
@@ -456,44 +488,52 @@ def main():
                         pending = state[p].get("pending")
                         if pending is not None:
                             pending["ebHash"] = data.get("hash", "")[:8]
+                            pending["ebSlot"] = data.get("slot")
+                            pending["ebPoint"] = eb_point_id(point)
                         else:
                             state[p]["ebHash"] = data.get("hash", "")[:8]
+                            state[p]["ebSlot"] = data.get("slot")
+                            state[p]["ebPoint"] = eb_point_id(point)
                         write_leios_status()
                     elif kind == "LeiosBlockCertified":
                         h = data.get("ebHash", "")
                         at_slot = data.get("atSlot")
-                        if h and h not in eb_certified:
-                            info = certificate_info(h)
-                            # This certifying block's record is held pending on
-                            # this node (its forge-prices came a beat earlier) —
-                            # stamp and release it now, so certification lands on
-                            # the very block that certified.
+                        point = eb_point(data.get("ebSlot"), h)
+                        if point is not None:
+                            info = certificate_info(point)
+                            # Always stamp this node's candidate. Lifecycle side
+                            # effects below are de-duplicated globally, but
+                            # suppressing this projection after another node saw
+                            # the certificate can leave the canonical candidate
+                            # looking like it announced an EB of its own.
                             pending = state[p].get("pending")
                             if pending is not None and pending.get("slot") == at_slot:
                                 apply_certificate(pending, info)
                             else:
-                                cert_by_slot[at_slot] = info
+                                cert_by_slot[(p, at_slot)] = info
                                 if len(cert_by_slot) > 50:  # unmatched — don't leak
                                     for k in sorted(cert_by_slot)[:25]:
                                         del cert_by_slot[k]
+                        if point is not None and point not in eb_certified:
                             # The certificate settles the EB's riders on-chain.
-                            riders = riders_by_eb.pop(h, None)
+                            riders = riders_by_eb.pop(point, None)
                             if riders:
                                 emit_removed([{"txid": t, "stage": "riding", "lane": "?"}
                                               for t in riders["txids"]])
                             # An older EB still holding riders was superseded:
                             # its txs left every mempool for a block that never
                             # got its certificate.
-                            eb_slot = eb_forged.get(h, {}).get("slot")
+                            eb_slot = eb_forged.get(point, {}).get("slot")
                             if eb_slot is not None:
                                 stale = [k for k, v in riders_by_eb.items()
                                          if v["slot"] is not None and v["slot"] < eb_slot]
                                 for k in stale:
                                     returned_pending.append(
-                                        {"ebHash": k,
+                                        {"ebPoint": k,
                                          "txids": set(riders_by_eb.pop(k)["txids"]),
                                          "seen": time.time(), "at": None})
-                        eb_certified.add(h)
+                        if point is not None:
+                            eb_certified.add(point)
                         write_leios_status()
                     elif kind == "LeiosMempoolStripped" and p == node1:
                         n = data.get("txCount")
@@ -512,20 +552,20 @@ def main():
                             for v in riders_by_eb.values():
                                 if strip_slot is None or (v["slot"] is not None and v["slot"] < strip_slot):
                                     v["txids"] = [t for t in v["txids"] if t not in claimed]
-                            h = data.get("ebHash", "")
-                            if h in eb_certified:
+                            point = eb_point(data.get("ebSlot"), data.get("ebHash", ""))
+                            if point in eb_certified:
                                 # certificate already landed (queue lag)
                                 emit_removed([{"txid": t, "stage": "riding", "lane": "?"}
                                               for t in batch["txids"]])
-                            else:
+                            elif point is not None:
                                 r = riders_by_eb.setdefault(
-                                    h, {"slot": data.get("ebSlot"), "txids": []})
+                                    point, {"slot": data.get("ebSlot"), "txids": []})
                                 r["txids"] += batch["txids"]
                     if kind == "LeiosMempoolReadmitted" and p == node1:
-                        h = data.get("ebHash", "")
+                        point = eb_point(data.get("ebSlot"), data.get("ebHash", ""))
                         accepted = data.get("txCount") or 0
                         for batch in returned_pending:
-                            if batch.get("ebHash") == h and batch["at"] is None:
+                            if batch.get("ebPoint") == point and batch["at"] is None:
                                 batch["at"] = 0 if accepted == 0 else time.time()
                                 break
                     continue
@@ -764,7 +804,9 @@ def main():
                     # the certificate this block counts (stamped by slot when the
                     # LeiosBlockCertified trace lands; usually attached while this
                     # record is held pending, just below)
-                    "certIn": cert_by_slot.pop(state[p].get("leaderSlot"), None),
+                    "certIn": cert_by_slot.pop(
+                        (p, state[p].get("leaderSlot")), None
+                    ),
                     "pool": state[p].get("pool"),
                     "qu": state[p]["qu"],
                     "qo": state[p]["qo"],
@@ -773,8 +815,13 @@ def main():
                     # the EB currently being filled on this log (sticky until a
                     # new one is forged): several rounds can share one EB
                     "ebHash": state[p].get("ebHash"),
+                    "ebSlot": state[p].get("ebSlot"),
+                    "ebPoint": state[p].get("ebPoint"),
                     # which node forged this block (the log that produced the trio)
                     "node": os.path.basename(os.path.dirname(p)),
+                    # Internal only: lets a late certificate trace be joined to
+                    # the correct competing candidate before canonical emission.
+                    "_traceSource": p,
                 }
                 if record["certIn"] is not None:
                     apply_certificate(record, record["certIn"])
