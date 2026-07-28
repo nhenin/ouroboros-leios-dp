@@ -32,7 +32,7 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # largest demo payload even after a sustained D=16 price climb; otherwise a
 # scenario labelled "ceiling bids" eventually evicts its own dependent chains.
 # The ledger still charges the live quote and refunds the unused headroom.
-: "${FEE:=25000000}"
+: "${FEE:=100000000}"
 : "${METADATA_BYTES:=2000}"
 : "${DELAY_MS:=200}"
 : "${CYCLES:=2000000}"
@@ -74,6 +74,38 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${FEE_REFUND_STAKE_VKEY:=${SOURCE_DIR}/config/stake-delegators/delegator1/staking.vkey}"
 
 RUN_LOG="${WORKING_DIR}.live-demo.log"
+INSTANCE_LOCK="${WORKING_DIR}.instance"
+
+# Two concurrent restart requests must not launch two feeders and tailers over
+# the same files. The root launcher kills the previous supervisor first; this
+# lock resolves the remaining race between replacement launchers atomically.
+acquire_instance_lock() {
+  local owner=""
+  for _ in 1 2 3; do
+    if mkdir "$INSTANCE_LOCK" 2>/dev/null; then
+      printf '%s\n' "$$" >"$INSTANCE_LOCK/pid"
+      return
+    fi
+    owner="$(cat "$INSTANCE_LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && kill -0 "$owner" >/dev/null 2>&1; then
+      echo "Live demo already supervised by PID $owner; refusing a duplicate launch." >&2
+      exit 1
+    fi
+    rm -rf "$INSTANCE_LOCK"
+  done
+  echo "Could not acquire live-demo instance lock: $INSTANCE_LOCK" >&2
+  exit 1
+}
+
+release_instance_lock() {
+  local owner=""
+  owner="$(cat "$INSTANCE_LOCK/pid" 2>/dev/null || true)"
+  if [ "$owner" = "$$" ]; then
+    rm -rf "$INSTANCE_LOCK"
+  fi
+}
+
+acquire_instance_lock
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -165,6 +197,7 @@ stop_everything() {
     kill -TERM "$pid" >/dev/null 2>&1 || true
   done
   wait "$devnet_pid" >/dev/null 2>&1 || true
+  release_instance_lock
   echo "Stopped."
 }
 
@@ -185,6 +218,7 @@ rm -f "$RUN_LOG"
 rm -f "$QUOTES_FILE"
 rm -f "${DEMO_DIR}/leios-status.json"
 rm -f "${DEMO_DIR}/lifecycle.json"
+rm -f "${DEMO_DIR}/feeder-status.json"
 # Start from a default actor population (the dashboard rewrites this live).
 cat >"$ACTOR_CONFIG" <<'JSON'
 {"honest":60,"patient":20,"impatient":20,"valueMinAda":1,"valueMaxAda":30,"urgencyMin":0.02,"urgencyMax":0.35,"urgentLatency":1,"optimisticLatency":4,"reservationMultiple":1,"feeBuffer":1.2,"delayMs":200,"laneMix":null,"label":"Calm day"}
@@ -257,6 +291,7 @@ sleep 1
 : >"${DEMO_DIR}/evicted-txs.ndjson"
 : >"${DEMO_DIR}/dropped-txs.ndjson"
 : >"${DEMO_DIR}/incentives.ndjson"
+rm -f "${DEMO_DIR}/feeder-status.json"
 
 # Stream every node's forge traces into the dashboard's live feed. Each block is
 # forged by exactly one node, so merging the three logs gives the full sequence.
@@ -406,7 +441,7 @@ fi
 #          feeder log -> aggregator -> evictions.ndjson, stage "rejected").
 # Generators restart cleanly: before each start we ask the node for the fund's
 # current largest UTxO and hand it to the feeder (--initial-txin/--initial-value).
-: "${T1_BID:=auto}"   # auto = one worst-case controller step above the dominant live quote
+: "${T1_BID:=auto}"   # auto = four worst-case controller steps above the dominant live quote
 : "${T1_METADATA:=10000}"
 : "${T1_DELAY_MS:=50}"
 : "${T2_FEE:=10000000}"
@@ -474,8 +509,10 @@ eviction_controller() {
         if [ "$want" = "type1" ]; then
           # Drive whichever quote currently determines max-fee validity. The
           # lanes may legitimately cross, so hard-coding urgent can make a burst
-          # miss admission after a standard storm. The bid covers exactly one
-          # worst-case D=16 update; the next adverse update prices out backlog.
+          # miss admission after a standard storm. Splitting the independent
+          # funding pool takes a few blocks, so reserve four worst-case D=16
+          # updates: the burst still crosses quickly once its admitted backlog
+          # starts filling blocks, without arriving already below the door price.
           read -r t1_bid t1_lane t1_quote <<EOF
 $(python3 -c "
 import json
@@ -490,7 +527,9 @@ quote = max(urgent, standard)
 size = $T1_METADATA + 300
 configured = '$T1_BID'
 if configured == 'auto':
-    next_quote = (quote * 17 + 15) // 16
+    next_quote = quote
+    for _ in range(4):
+        next_quote = (next_quote * 17 + 15) // 16
     bid = 155381 + next_quote * size + 1
 else:
     bid = int(configured)
@@ -510,7 +549,7 @@ EOF
           else
             t1_lane_args=(--optimistic-first 0 --urgent-after 1)
           fi
-          echo "type1 burst: ${t1_lane} lane, bid ${t1_bid} lovelace (one D=16 step above quote ${t1_quote})"
+          echo "type1 burst: ${t1_lane} lane, bid ${t1_bid} lovelace (four D=16 steps above quote ${t1_quote})"
           CURRENT_T1_BID="$t1_bid"
           CURRENT_T1_LANE="$t1_lane"
           "$LANE_FEEDER" --socket "$socket" --funds "$WORKING_DIR/funds.json" \

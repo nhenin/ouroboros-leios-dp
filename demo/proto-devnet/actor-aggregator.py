@@ -43,10 +43,11 @@ top-level "unattributedAccepted" counter instead.
 
 Usage: actor-aggregator.py <feeder.log> <out.ndjson> [bucket-size]
                            [--removed <removed-txs.ndjson>] [--lifecycle <lifecycle.json>]
+                           [--status <feeder-status.json>]
 
---removed and --lifecycle default to <out dir>/removed-txs.ndjson and
-<out dir>/lifecycle.json — the whole plumbing writes into one demo dir, so a
-bare respawn (watchdog) keeps the full lifecycle alive.
+The optional paths default to the corresponding files in <out dir> — the whole
+plumbing writes into one demo dir, so a bare respawn (watchdog) keeps the full
+lifecycle and feeder readiness state alive.
 """
 
 import json
@@ -60,6 +61,12 @@ DECISION_RE = re.compile(
     r"(?:.*?gen=(\S+))?(?:.*?\st=(\d+))?"
 )
 ACCEPTED_RE = re.compile(r"^(\d+): accepted (urgent|optimistic) \"([0-9a-f]{64})\"")
+ADOPTED_RE = re.compile(r"^(optimistic|urgent) lane: adopted ")
+PROVISIONED_RE = re.compile(
+    r"^(optimistic|urgent) lane: provisioned \d+ fan-out heads; waiting for (\d+) confirmed chains"
+)
+READY_RE = re.compile(r"^(optimistic|urgent) lane: (\d+) confirmed chains ready")
+RETRY_RE = re.compile(r"^(optimistic|urgent) lane: fan-out attempt failed")
 
 
 def tail_lines(path, state):
@@ -105,12 +112,15 @@ def main():
     args = sys.argv[1:]
     removed_path = None
     lifecycle_path = None
+    status_path = None
     if "--removed" in args:
         i = args.index("--removed"); removed_path = args[i + 1]; del args[i:i + 2]
     if "--lifecycle" in args:
         i = args.index("--lifecycle"); lifecycle_path = args[i + 1]; del args[i:i + 2]
+    if "--status" in args:
+        i = args.index("--status"); status_path = args[i + 1]; del args[i:i + 2]
     if len(args) < 2:
-        sys.exit("usage: actor-aggregator.py <feeder.log> <out.ndjson> [bucket-size] [--removed f] [--lifecycle f]")
+        sys.exit("usage: actor-aggregator.py <feeder.log> <out.ndjson> [bucket-size] [--removed f] [--lifecycle f] [--status f]")
     log_path, out_path = args[0], args[1]
     bucket_size = int(args[2]) if len(args) > 2 else 120
     demo_dir = os.path.dirname(os.path.abspath(out_path))
@@ -118,6 +128,8 @@ def main():
         removed_path = os.path.join(demo_dir, "removed-txs.ndjson")
     if lifecycle_path is None:
         lifecycle_path = os.path.join(demo_dir, "lifecycle.json")
+    if status_path is None:
+        status_path = os.path.join(demo_dir, "feeder-status.json")
     # Every dropped tx, attributed: txid -> generation + why. The dashboard
     # joins this against the tailer's evicted-txs detail stream to tell each
     # generation's drop story EXACTLY (time windows alone kidnap neighbours'
@@ -131,6 +143,7 @@ def main():
 
     counts = {"urgent": 0, "optimistic": 0, "shed": 0}
     last_qu, last_qo = 88, 44
+    last_decision_ts = time.time()
     seen = 0
     bucket = 0
 
@@ -150,6 +163,27 @@ def main():
     # without its sent — the one path to journal totals exceeding "sent".
     unattributed = 0
     last_snapshot = 0.0
+    feeder_status = {
+        "ready": False,
+        "phase": "starting",
+        "optimistic": {"stage": "waiting", "heads": 0, "retries": 0},
+        "urgent": {"stage": "waiting", "heads": 0, "retries": 0},
+        "updated": time.time(),
+    }
+
+    def write_feeder_status():
+        feeder_status["ready"] = all(
+            feeder_status[lane]["stage"] == "ready"
+            for lane in ("optimistic", "urgent")
+        )
+        feeder_status["phase"] = "active" if feeder_status["ready"] else "provisioning"
+        feeder_status["updated"] = time.time()
+        tmp = status_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(feeder_status, f)
+        os.replace(tmp, status_path)
+
+    write_feeder_status()
 
     def gen_bucket(label):
         if label not in generations:
@@ -190,14 +224,51 @@ def main():
         progressed = False
         for line in tail_lines(log_path, handles):
             progressed = True
+            match = ADOPTED_RE.match(line)
+            if match:
+                lane = match.group(1)
+                # A new optimistic adoption starts a complete actor-feeder
+                # generation. Clear both lanes so a restart cannot inherit a
+                # stale "ready" state from the earlier generation.
+                if lane == "optimistic":
+                    for key in ("optimistic", "urgent"):
+                        feeder_status[key].update(stage="adopting", heads=0)
+                else:
+                    feeder_status[lane].update(stage="adopting", heads=0)
+                write_feeder_status()
+            match = PROVISIONED_RE.match(line)
+            if match:
+                lane, heads = match.group(1), int(match.group(2))
+                feeder_status[lane].update(stage="confirming", heads=heads)
+                write_feeder_status()
+            match = READY_RE.match(line)
+            if match:
+                lane, heads = match.group(1), int(match.group(2))
+                feeder_status[lane].update(stage="ready", heads=heads)
+                write_feeder_status()
+            match = RETRY_RE.match(line)
+            if match:
+                lane = match.group(1)
+                feeder_status[lane]["stage"] = "retrying"
+                feeder_status[lane]["retries"] += 1
+                write_feeder_status()
+            if line.startswith("Actor mode:") and not feeder_status["ready"]:
+                for lane in ("optimistic", "urgent"):
+                    feeder_status[lane]["stage"] = "ready"
+                write_feeder_status()
             match = DECISION_RE.search(line)
             if match:
+                if not feeder_status["ready"]:
+                    for lane_name in ("optimistic", "urgent"):
+                        feeder_status[lane_name]["stage"] = "ready"
+                    write_feeder_status()
                 n, lane = int(match.group(1)), match.group(2)
                 last_qu, last_qo = int(match.group(3)), int(match.group(4))
                 label = match.group(5) or "warmup"
                 # Prefer the line's own wall-clock stamp: it survives a log
                 # replay, so generation time ranges stay real after a restart.
                 ts = float(match.group(6)) if match.group(6) else time.time()
+                last_decision_ts = ts
                 g = gen_bucket(label)
                 if g["sent"] == 0:
                     g["firstSeen"] = ts
@@ -227,6 +298,7 @@ def main():
                         "shed": counts["shed"],
                         "qu": last_qu,
                         "qo": last_qo,
+                        "t": last_decision_ts,
                     }
                     with open(out_path, "a") as out:
                         out.write(json.dumps(record) + "\n")

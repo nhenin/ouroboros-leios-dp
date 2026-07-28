@@ -43,8 +43,8 @@ QUEUE_RE = re.compile(
 )
 
 # Each lane's diffusion-time budget: mirrors the devnet config's
-# MempoolTimeoutCapacity (15 s) split by laneTimeoutCapacity (urgent 1/9 — a
-# short window, urgent traffic must not queue for hours — patient 8/9).
+# MempoolTimeoutCapacity (60 s) split by laneTimeoutCapacity (urgent 1/4 — a
+# short window, urgent traffic must not queue for hours — patient 3/4).
 MEMPOOL_TIME_BUDGET_S = 60.0
 URGENT_TIME_SHARE = 1.0 / 4.0
 PRICE_RE = re.compile(r"forge prices:.*?urgent=(\d+).*?optimistic=(\d+)")
@@ -646,21 +646,29 @@ def main():
                             blob = json.dumps(tx)
                             priced = "BidBelowQuote" in blob
                             stage = "evicted" if priced else "cleared"
-                            short = (tx.get("tx") or {}).get("txid") if isinstance(tx, dict) else None
+                            tx_summary = (tx.get("tx") or {}) if isinstance(tx, dict) else {}
+                            short = tx_summary.get("txid")
                             bid_required = MISMATCH_RE.search(blob) if priced else None
                             # the tx's (single) input parent, for cascade detection
                             parent = None
-                            pm = SPEND_INPUT_RE.search(blob)
-                            if pm:
-                                parent = pm.group(1)[:8]
+                            input_ids = tx_summary.get("inputTxIds") or []
+                            if input_ids:
+                                parent = str(input_ids[0])[:8]
+                            else:
+                                pm = SPEND_INPUT_RE.search(blob)
+                                if pm:
+                                    parent = pm.group(1)[:8]
+                            lane = tx_summary.get("lane")
+                            if lane not in ("urgent", "optimistic"):
+                                lane = "urgent" if "dtbrInclusion = Urgent" in blob \
+                                    else "optimistic" if "dtbrInclusion = Optimistic" in blob \
+                                    else "?"
                             if short:
                                 entries.append({
                                     "txid": short,
                                     "stage": stage,
                                     "parent": parent,
-                                    "lane": "urgent" if "dtbrInclusion = Urgent" in blob
-                                            else "optimistic" if "dtbrInclusion = Optimistic" in blob
-                                            else "?",
+                                    "lane": lane,
                                     "bid": int(bid_required.group(1)) if bid_required else None,
                                     "required": int(bid_required.group(2)) if bid_required else None,
                                 })
@@ -674,9 +682,9 @@ def main():
                                     and int(bid_required.group(1)) == current_t1_bid():
                                 b["burst"] += 1
                             b["spent"] += 1 if "AllInputsAreSpent" in blob else 0
-                            if "dtbrInclusion = Urgent" in blob:
+                            if lane == "urgent":
                                 b["urgent"] += 1
-                            elif "dtbrInclusion = Optimistic" in blob:
+                            elif lane == "optimistic":
                                 b["optimistic"] += 1
                         for stage, b in buckets.items():
                             emit_eviction({
@@ -747,39 +755,44 @@ def main():
                 except Exception:
                     pass
                 continue
-            lane = LANE_RE.search(line)
-            if lane:
-                discard_incomplete_pending(p)
-                state[p]["rb"], state[p]["eb"] = int(lane.group(1)), int(lane.group(2))
-                state[p]["rbBytes"] = int(lane.group(3)) if lane.group(3) else None
-                state[p]["ebBytes"] = int(lane.group(4)) if lane.group(4) else None
-                state[p]["ebHeld"] = lane.group(5) == "true" if lane.group(5) else None
-                # urgent riders merged into the EB (absent on pre-rider builds)
-                state[p]["ebUrgent"] = int(lane.group(6)) if lane.group(6) else None
+            if "forge lanes:" in line:
+                lane = LANE_RE.search(line)
+                if lane:
+                    discard_incomplete_pending(p)
+                    state[p]["rb"], state[p]["eb"] = int(lane.group(1)), int(lane.group(2))
+                    state[p]["rbBytes"] = int(lane.group(3)) if lane.group(3) else None
+                    state[p]["ebBytes"] = int(lane.group(4)) if lane.group(4) else None
+                    state[p]["ebHeld"] = lane.group(5) == "true" if lane.group(5) else None
+                    # urgent riders merged into the EB (absent on pre-rider builds)
+                    state[p]["ebUrgent"] = int(lane.group(6)) if lane.group(6) else None
                 continue
-            queue = QUEUE_RE.search(line)
-            if queue:
-                state[p]["qu"], state[p]["qo"] = int(queue.group(1)), int(queue.group(2))
-                if queue.group(3) is not None:
-                    qu_bytes, qu_cap = int(queue.group(3)), int(queue.group(4))
-                    qo_bytes, qo_cap = int(queue.group(6)), int(queue.group(7))
-                    qu_secs, qo_secs = float(queue.group(5)), float(queue.group(8))
-                    qu_time_budget = MEMPOOL_TIME_BUDGET_S * URGENT_TIME_SHARE
-                    qo_time_budget = MEMPOOL_TIME_BUDGET_S * (1 - URGENT_TIME_SHARE)
-                    state[p]["pool"] = {
-                        "quBytePct": round(100 * qu_bytes / qu_cap, 1) if qu_cap else None,
-                        "quTimePct": round(100 * qu_secs / qu_time_budget, 1),
-                        "qoBytePct": round(100 * qo_bytes / qo_cap, 1) if qo_cap else None,
-                        "qoTimePct": round(100 * qo_secs / qo_time_budget, 1),
-                        # raw values so the dashboard can print the actual
-                        # limits, not just percentages
-                        "quBytes": qu_bytes, "quCap": qu_cap,
-                        "quSecs": round(qu_secs, 2), "quBudgetS": qu_time_budget,
-                        "qoBytes": qo_bytes, "qoCap": qo_cap,
-                        "qoSecs": round(qo_secs, 2), "qoBudgetS": qo_time_budget,
-                    }
+            if "forge queue:" in line:
+                queue = QUEUE_RE.search(line)
+                if queue:
+                    state[p]["qu"], state[p]["qo"] = int(queue.group(1)), int(queue.group(2))
+                    if queue.group(3) is not None:
+                        qu_bytes, qu_cap = int(queue.group(3)), int(queue.group(4))
+                        qo_bytes, qo_cap = int(queue.group(6)), int(queue.group(7))
+                        qu_secs, qo_secs = float(queue.group(5)), float(queue.group(8))
+                        qu_time_budget = MEMPOOL_TIME_BUDGET_S * URGENT_TIME_SHARE
+                        qo_time_budget = MEMPOOL_TIME_BUDGET_S * (1 - URGENT_TIME_SHARE)
+                        state[p]["pool"] = {
+                            "quBytePct": round(100 * qu_bytes / qu_cap, 1) if qu_cap else None,
+                            "quTimePct": round(100 * qu_secs / qu_time_budget, 1),
+                            "qoBytePct": round(100 * qo_bytes / qo_cap, 1) if qo_cap else None,
+                            "qoTimePct": round(100 * qo_secs / qo_time_budget, 1),
+                            # raw values so the dashboard can print the actual
+                            # limits, not just percentages
+                            "quBytes": qu_bytes, "quCap": qu_cap,
+                            "quSecs": round(qu_secs, 2), "quBudgetS": qu_time_budget,
+                            "qoBytes": qo_bytes, "qoCap": qo_cap,
+                            "qoSecs": round(qo_secs, 2), "qoBudgetS": qo_time_budget,
+                        }
                 continue
-            price = PRICE_RE.search(line)
+            if "forge prices:" in line:
+                price = PRICE_RE.search(line)
+            else:
+                price = None
             if price:
                 urgent = int(price.group(1))
                 optimistic = int(price.group(2))
