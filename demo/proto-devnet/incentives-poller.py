@@ -140,15 +140,23 @@ def stake_keyhash(vkey_path):
 
 def query_pots(cli_args, refund_keyhash):
     diag = subprocess.run(
-        ["cardano-cli", "latest", "query", "ledger-state", *cli_args],
+        ["cardano-cli", "latest", "query", "ledger-state", *cli_args, "--output-text"],
         capture_output=True,
-        text=True,
         timeout=30,
     )
     if diag.returncode != 0:
-        raise RuntimeError(diag.stderr.strip()[:200])
-    hexstr = re.sub(r"[^0-9a-fA-F]", "", re.sub(r"#.*", "", diag.stdout))
-    nes, _ = cbor_decode(bytes.fromhex(hexstr))
+        raise RuntimeError(diag.stderr.decode("utf8", "replace").strip()[:200])
+
+    # Current cardano-cli writes raw CBOR for --output-text.  Older pinned
+    # builds wrote an annotated hexadecimal rendering, so retain that format
+    # as a compatibility fallback.
+    raw = diag.stdout
+    try:
+        nes, _ = cbor_decode(raw)
+    except Exception:
+        rendered = raw.decode("utf8", "replace")
+        hexstr = re.sub(r"[^0-9a-fA-F]", "", re.sub(r"#.*", "", rendered))
+        nes, _ = cbor_decode(bytes.fromhex(hexstr))
 
     pricing = at(nes, [3, 1, 1, 6])
     pending = pricing[3][1] if isinstance(pricing[3], tuple) else []
